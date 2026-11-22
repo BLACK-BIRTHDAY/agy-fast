@@ -1073,24 +1073,35 @@ function truncateWithNotice(text, maxChars) {
 ... [truncated: showed ${slice.length} of ${text.length} chars]`;
   return result.length <= limit ? result : sliceSafeChars(result, limit);
 }
-function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
-  if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
-  const joined = sections.join(separator);
-  if (joined.length <= maxChars) return joined;
-  const sepTotal = separator.length * (sections.length - 1);
-  if (sepTotal >= maxChars) {
-    return truncateWithNotice(joined, maxChars);
+function sliceTailSafeChars(text, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  let start = text.length - limit;
+  const firstCode = text.charCodeAt(start);
+  if (firstCode >= 56320 && firstCode <= 57343) {
+    start += 1;
   }
-  let remainingBudget = maxChars - sepTotal;
-  const budgets = new Array(sections.length).fill(0);
-  const order = sections.map((s, idx) => ({ idx, len: s.length })).sort((a, b) => a.len - b.len);
+  return text.slice(start);
+}
+function computeWaterFillBudgets(sizes, totalBudget) {
+  if (sizes.length === 0) return [];
+  const budgets = new Array(sizes.length).fill(0);
+  if (!Number.isFinite(totalBudget) || totalBudget <= 0) return budgets;
+  let remainingBudget = Math.trunc(totalBudget);
+  if (remainingBudget <= 0) return budgets;
+  const order = sizes.map((raw, idx) => ({
+    idx,
+    size: Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 0
+  })).sort((a, b) => a.size - b.size || a.idx - b.idx);
   for (let i = 0; i < order.length; i++) {
     const remainingCount = order.length - i;
     const share = Math.floor(remainingBudget / remainingCount);
     const item = order[i];
-    if (item.len <= share) {
-      budgets[item.idx] = item.len;
-      remainingBudget -= item.len;
+    if (item.size <= share) {
+      budgets[item.idx] = item.size;
+      remainingBudget -= item.size;
     } else {
       for (let j = i; j < order.length; j++) {
         const rem = order.length - j;
@@ -1101,6 +1112,20 @@ function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
       break;
     }
   }
+  return budgets;
+}
+function fitSectionsToBudget(sections, maxChars, separator = "\n\n") {
+  if (sections.length === 0 || !Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const joined = sections.join(separator);
+  if (joined.length <= maxChars) return joined;
+  const sepTotal = separator.length * (sections.length - 1);
+  if (sepTotal >= maxChars) {
+    return truncateWithNotice(joined, maxChars);
+  }
+  const budgets = computeWaterFillBudgets(
+    sections.map((s) => s.length),
+    maxChars - sepTotal
+  );
   const fitted = sections.map((sec, idx) => truncateWithNotice(sec, budgets[idx] ?? 0)).join(separator);
   return fitted.length <= maxChars ? fitted : truncateWithNotice(fitted, maxChars);
 }
@@ -1117,34 +1142,29 @@ function fitSectionsToByteBudget(sections, maxChars, maxBytes, separator = "\n\n
   if (sepBytes >= maxBytes) {
     return truncateWithByteNotice(charFitted, maxBytes);
   }
-  let remainingBytes = maxBytes - sepBytes;
-  const byteBudgets = new Array(sections.length).fill(0);
-  const order = sections.map((s, idx) => ({ idx, bytes: Buffer.byteLength(s, "utf8") })).sort((a, b) => a.bytes - b.bytes);
-  for (let i = 0; i < order.length; i++) {
-    const remainingCount = order.length - i;
-    const share = Math.floor(remainingBytes / remainingCount);
-    const item = order[i];
-    if (item.bytes <= share) {
-      byteBudgets[item.idx] = item.bytes;
-      remainingBytes -= item.bytes;
-    } else {
-      for (let j = i; j < order.length; j++) {
-        const rem = order.length - j;
-        const alloc = Math.floor(remainingBytes / rem);
-        byteBudgets[order[j].idx] = alloc;
-        remainingBytes -= alloc;
-      }
-      break;
-    }
-  }
+  const byteBudgets = computeWaterFillBudgets(
+    sections.map((s) => Buffer.byteLength(s, "utf8")),
+    maxBytes - sepBytes
+  );
   let fitted = sections.map((sec, idx) => truncateWithByteNotice(sec, byteBudgets[idx] ?? 0)).join(separator);
   if (fitted.length > maxChars) {
     fitted = truncateWithNotice(fitted, maxChars);
   }
   return Buffer.byteLength(fitted, "utf8") <= maxBytes ? fitted : truncateWithByteNotice(fitted, maxBytes);
 }
-var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:error|fail|failed|failing|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
-var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯+\s*failed tests|compilation error)/i;
+var BENIGN_ZERO_COUNT_PATTERN = /\b(?:(?:0|no)\s+(?:errors?|warnings?|fail(?:ed|ures?|ing)?)(?:\(s\))?|(?:errors|error\(s\)|warnings|warning\(s\)|fail(?:ed|ures|ure\(s\)|ing)?)\s*(?::|=|\()\s*0\b(?!\.\d)\)?)/gi;
+function stripBenignZeroCounts(line) {
+  return line.replace(BENIGN_ZERO_COUNT_PATTERN, " ");
+}
+var ERROR_LINE_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|exception|traceback|panic|fatal|assertion|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|e\d{4}|cannot find|not found|unexpected|undefined)\b|caused by:|application failed to start|compilation error|<<<\s*(?:failure|error)|找不到符号|符号:|位置:)/i;
+var ROOT_CAUSE_HEADER_PATTERN = /(?:^\s*(?:description|action):|caused by:|application failed to start|⎯\s*failed tests|compilation error)/i;
+var FOLD_DANGER_TOKEN_PATTERN = /(?:\berr!|\b(?:errors?|fail(?:ed|ing|ure|ures)?|warns?|warnings?|exceptions?|tracebacks?|panics?|fatals?|assertions?|syntaxerror|typeerror|referenceerror|zoderror|validationerror|ts\d{4}|cannot find|not found|compilation error)\b|caused by:|application failed to start|<<<\s*(?:failure|error)|[✖✘✗×]\s+)/i;
+function isErrorLine(line) {
+  return ERROR_LINE_PATTERN.test(stripBenignZeroCounts(line));
+}
+function hasFoldDangerToken(line) {
+  return FOLD_DANGER_TOKEN_PATTERN.test(stripBenignZeroCounts(line));
+}
 var JSON_INFO_LOG_PATTERNS = [
   /^\s*\{"level":(?:10|20|30)\b/,
   /^\s*\{[^}]*"level"\s*:\s*"(?:trace|debug|info)"/i
@@ -1157,68 +1177,404 @@ var ALWAYS_NOISE_LINE_PATTERNS = [
 function isFailureNoiseLine(line) {
   if (ALWAYS_NOISE_LINE_PATTERNS.some((re) => re.test(line))) return true;
   if (JSON_INFO_LOG_PATTERNS.some((re) => re.test(line))) {
-    return !/"statusCode"\s*:\s*5\d\d|\b(?:error|exception|failed|fatal)\b/i.test(line);
+    return !/"statusCode"\s*:\s*5\d\d|\b(?:error|exception|failed|fatal)\b/i.test(
+      stripBenignZeroCounts(line)
+    );
   }
   return false;
 }
 var SUMMARY_LINE_PATTERN = /\b(passed|tests?|specs?|suites?|ok|warnings?|errors?|built in|compiled|done in|finished)\b/i;
-function formatCompactCommandOutput(params) {
-  const out = normalizeTerminalOutput(params.stdout);
-  const err = normalizeTerminalOutput(params.stderr);
-  const combined = [out, err].filter(Boolean).join("\n");
-  if (params.error) {
-    return truncateWithNotice(`spawn error: ${params.error}`, params.maxChars);
+var MONOREPO_PREFIX_PATTERN = /^(?:@[\w.-]+\/)?[\w./-]+(?::[A-Za-z][\w.-]*|\s+[A-Za-z][\w.-]*):\s+/;
+var GREEN_BUILD_OR_PASS_PATTERNS = [
+  // Vite / Rollup / esbuild / Webpack / bundler banners & asset size lines
+  /^(?:vite|rollup|esbuild|webpack|rspack|parcel|tsup|rolldown)\s+v?\d[\w.-]*\b/i,
+  /^transforming(?:\.\.\.|\s*\(\d+\).*|\s+\d+\s+modules?)?$/i,
+  /^(?:[✓✔]\s*)?\d+\s+modules?\s+transformed\.?$/i,
+  /^(?:rendering chunks|computing (?:gzip|brotli) size|building (?:for |SSR )?production|bundling|minifying|emitting assets)(?:\.{0,3})$/i,
+  /^(?:\.\.?\/)?(?:dist|build|out|\.next|\.output|public|assets|lib)\/\S+\s+\d+(?:\.\d+)?\s*(?:B|kB|KB|MB|GB|KiB|MiB|bytes)\b/i,
+  /^\S+\.(?:m?js|cjs|css|html|svg|png|woff2?|json|map|wasm)\s+\d+(?:\.\d+)?\s*(?:B|kB|KB|MB|GB|KiB|MiB)(?:\s+[│|]\s*(?:gzip|brotli|map):|\s*$)/i,
+  /^(?:[✓✔⚡]\s*)?built\b.*(?:\bin\s{1,4}\d+(?:\.\d+)?\s{0,4}(?:ms|s|m)\b|\(\s{0,4}\d+(?:\.\d+)?\s{0,4}(?:B|KB|kB|MB|GB|KiB|MiB)\s{0,4}\))/i,
+  /^(?:[✓✔⚡]\s*)?(?:done in\s+\d+(?:\.\d+)?\s*(?:ms|s|m)\.?|build (?:succeeded|completed|finished)\b|compiled successfully\b|bundle created\b)/i,
+  /^(?:asset|chunk|orphan modules|runtime modules|cacheable modules)\s+\S.*\b(?:bytes|KiB|MiB|kB|KB|MB|modules?)\b/i,
+  // npm / pnpm / yarn / turbo script & workspace banners
+  /^>\s+(?:@[\w.-]+\/)?[\w.-]+@[\w.+-]+(?:\s|$)/,
+  /^>\s+(?:vite|tsc|esbuild|rollup|webpack|rspack|tsup|unbuild|next|nuxt|astro|svelte-kit|vitest|jest|mocha|pnpm|npm|yarn|turbo|nx|node|tsx)\b/,
+  /^(?:@[\w.-]+\/)?[\w./-]+\s+[A-Za-z][\w.-]*\$\s+\S/,
+  /^Scope:\s+\d+\s+of\s+\d+\s+workspace projects\b/i,
+  /^Tasks:\s+\d+\s+successful\b/i,
+  /^Cached:\s+\d+\s+cached\b/i,
+  /^cache hit,\s+replaying logs\b/i,
+  /^Time:\s+\d+(?:\.\d+)?\s*(?:ms|s|m)\b/i,
+  /^(?:yarn run v\d|•\s+Packages in scope:|•\s+Running\s+\S+\s+in\s+\d+\s+packages)/i,
+  // Test pass lines (Vitest / Jest / Mocha / Node / Go / Cargo / TAP)
+  /^[✓✔]\s+\S/,
+  /^PASS\s+\S/,
+  /^(?:---\s+PASS:\s*|===\s+(?:RUN|PAUSE|CONT)\s+)\S/,
+  /^ok\t\S/,
+  /^ok\s+\S+\s+(?:\d+(?:\.\d+)?s|\(cached\))/i,
+  /^ok\s+\d+\s+-\s+\S/,
+  /^test\s+\S+\s+\.\.\.\s+ok\b/,
+  /^running\s+\d+\s+tests?$/i,
+  /^(?:Test Files|Tests|Suites|Snapshots|Start at|Duration|test result:\s{0,4}ok\.)\s.*(?:\bpassed\b|\btotal\b|\b\d+(?:\.\d+)?(?:ms|s)\b|\bok\.)/i,
+  // Rust / Go / Gradle / Maven progress
+  /^(?:Compiling|Checking|Downloading|Downloaded|Updating|Fresh|Locking|Packaging|Documenting|Finished)\s+\S/,
+  /^go:\s+downloading\s+\S/,
+  /^>\s+Task\s+:[\w:.-]+\s+(?:UP-TO-DATE|FROM-CACHE|NO-SOURCE|SKIPPED)\s*$/,
+  /^\[INFO\]/
+];
+var MIN_FOLD_RUN_LINES = 4;
+var PROTECTED_TAIL_LINES = 15;
+function isGreenBuildOrPassLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (hasFoldDangerToken(trimmed)) return false;
+  if (GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(trimmed))) {
+    return true;
   }
-  if (params.timedOut) {
-    const tail = getTailLines(combined, 20);
-    return truncateWithNotice(
-      tail ? `TIMED OUT
-${tail}` : "TIMED OUT (no output)",
-      params.maxChars
-    );
+  const prefixMatch = MONOREPO_PREFIX_PATTERN.exec(trimmed);
+  if (prefixMatch) {
+    const inner = trimmed.slice(prefixMatch[0].length).trim();
+    if (!inner) return false;
+    if (inner === "Done") return true;
+    return GREEN_BUILD_OR_PASS_PATTERNS.some((re) => re.test(inner));
   }
-  if (params.exitCode === 0) {
-    if (!combined) return "OK";
-    const lines2 = combined.split("\n").map((l) => l.trim()).filter(Boolean);
-    const summaryLines = lines2.filter((l) => SUMMARY_LINE_PATTERN.test(l));
-    const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines2.length <= 2 ? lines2 : [lines2[lines2.length - 1]];
-    return truncateWithNotice(picked.join(" | "), Math.min(params.maxChars, 320));
+  return false;
+}
+function formatLastCollapsedPreview(line) {
+  const trimmed = line.trim();
+  if (trimmed.length <= 120) return trimmed;
+  return `${sliceSafeChars(trimmed, 117)}...`;
+}
+function foldGreenBuildPhaseLines(lines) {
+  const foldableEnd = Math.max(0, lines.length - PROTECTED_TAIL_LINES);
+  if (foldableEnd < MIN_FOLD_RUN_LINES) {
+    return { lines, collapsedLines: 0 };
   }
-  const rawLines = combined.split("\n");
-  const filteredLines = rawLines.filter((line) => !isFailureNoiseLine(line));
-  const lines = filteredLines.length > 0 ? filteredLines : rawLines;
-  const cleanedCombined = lines.join("\n");
-  if (cleanedCombined.length <= params.maxChars) {
-    return cleanedCombined || `Exited with code ${params.exitCode ?? "unknown"}`;
+  const out = [];
+  let collapsedLines = 0;
+  let i = 0;
+  while (i < foldableEnd) {
+    if (!isGreenBuildOrPassLine(lines[i])) {
+      out.push(lines[i]);
+      i++;
+      continue;
+    }
+    const start = i;
+    let lastGreen = i;
+    let greenCount = 1;
+    i++;
+    while (i < foldableEnd) {
+      const cur = lines[i];
+      if (isGreenBuildOrPassLine(cur)) {
+        lastGreen = i;
+        greenCount++;
+        i++;
+      } else if (cur.trim() === "") {
+        i++;
+      } else {
+        break;
+      }
+    }
+    if (greenCount >= MIN_FOLD_RUN_LINES) {
+      const runLen = lastGreen - start + 1;
+      out.push(
+        `... (collapsed ${runLen} build/pass lines; last: ${formatLastCollapsedPreview(lines[lastGreen])})`
+      );
+      collapsedLines += runLen;
+      i = lastGreen + 1;
+    } else {
+      for (let j = start; j <= lastGreen; j++) {
+        out.push(lines[j]);
+      }
+      i = lastGreen + 1;
+    }
   }
+  for (let j = foldableEnd; j < lines.length; j++) {
+    out.push(lines[j]);
+  }
+  return { lines: out, collapsedLines };
+}
+function renderSelectedIndices(lines, indices, leadingOmission) {
+  if (indices.length === 0) return "";
+  const out = [];
+  if (leadingOmission && indices[0] > 0) {
+    out.push(`... (${indices[0]} lines omitted) ...`);
+  }
+  let prev = -1;
+  for (const idx of indices) {
+    if (prev !== -1 && idx > prev + 1) {
+      out.push(`... (${idx - prev - 1} lines omitted) ...`);
+    }
+    out.push(lines[idx]);
+    prev = idx;
+  }
+  return out.join("\n");
+}
+function packTailIndices(lines, candidates, budget, leadingOmission) {
+  if (candidates.length === 0 || budget <= 0) {
+    return { indices: [], text: "" };
+  }
+  const chosenRev = [];
+  let usedChars = 0;
+  for (let k = candidates.length - 1; k >= 0; k--) {
+    const idx = candidates[k];
+    const lineLen = lines[idx].length;
+    let add = lineLen;
+    if (chosenRev.length > 0) {
+      const nextIdx = chosenRev[chosenRev.length - 1];
+      if (nextIdx > idx + 1) {
+        const gapMarkerLen = `... (${nextIdx - idx - 1} lines omitted) ...`.length;
+        add = lineLen + 1 + gapMarkerLen + 1;
+      } else {
+        add = lineLen + 1;
+      }
+    }
+    const headerLen = leadingOmission && idx > 0 ? `... (${idx} lines omitted) ...
+`.length : 0;
+    if (usedChars + add + headerLen <= budget) {
+      chosenRev.push(idx);
+      usedChars += add;
+    } else {
+      break;
+    }
+  }
+  const indices = chosenRev.reverse();
+  return {
+    indices,
+    text: renderSelectedIndices(lines, indices, leadingOmission)
+  };
+}
+function compactSingleOversizedErrorLine(line, lineIdx, limit) {
+  const rawPrefix = lineIdx > 0 ? `... (${lineIdx} lines omitted) ...
+` : "";
+  const prefix = limit - rawPrefix.length >= 40 ? rawPrefix : "";
+  const avail = limit - prefix.length;
+  if (line.length <= avail) {
+    return `${prefix}${line}`;
+  }
+  const joiner = " ... ";
+  if (avail <= joiner.length + 2) {
+    return `${prefix}${sliceTailSafeChars(line, avail)}`;
+  }
+  const contentAvail = avail - joiner.length;
+  const headChars = Math.max(1, Math.floor(contentAvail * 0.28));
+  const tailChars = Math.max(1, contentAvail - headChars);
+  return `${prefix}${sliceSafeChars(line, headChars)}${joiner}${sliceTailSafeChars(line, tailChars)}`;
+}
+function compactLongFailureLines(lines, maxChars) {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  const limit = Math.trunc(maxChars);
+  if (limit <= 0) return "";
+  const fullText = lines.join("\n");
+  if (fullText.length <= limit) return fullText;
+  if (limit < 80) {
+    if (limit <= 3) return sliceTailSafeChars(fullText, limit);
+    return `...${sliceTailSafeChars(fullText, limit - 3)}`;
+  }
+  let firstErrorLineIdx = -1;
   const keepIndices = /* @__PURE__ */ new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (ROOT_CAUSE_HEADER_PATTERN.test(line)) {
+      if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 8);
       for (let j = from; j <= to; j++) keepIndices.add(j);
-    } else if (ERROR_LINE_PATTERN.test(line)) {
+    } else if (isErrorLine(line)) {
+      if (firstErrorLineIdx === -1) firstErrorLineIdx = i;
       const from = Math.max(0, i - 1);
       const to = Math.min(lines.length - 1, i + 3);
       for (let j = from; j <= to; j++) keepIndices.add(j);
     }
   }
-  const tailStart = Math.max(0, lines.length - 12);
+  const tailStart = Math.max(0, lines.length - PROTECTED_TAIL_LINES);
   for (let i = tailStart; i < lines.length; i++) {
     keepIndices.add(i);
   }
-  const sorted = [...keepIndices].sort((a, b) => a - b);
-  const outLines = [];
-  let prev = -1;
-  for (const idx of sorted) {
-    if (prev !== -1 && idx > prev + 1) {
-      outLines.push(`... (${idx - prev - 1} lines omitted) ...`);
-    }
-    outLines.push(lines[idx]);
-    prev = idx;
+  if (firstErrorLineIdx === -1) {
+    const allIndices = Array.from({ length: lines.length }, (_, idx) => idx);
+    const tailPacked2 = packTailIndices(lines, allIndices, limit, true);
+    if (tailPacked2.text) return tailPacked2.text;
+    return `...${sliceTailSafeChars(lines[lines.length - 1], limit - 3)}`;
   }
-  return truncateWithNotice(outLines.join("\n"), params.maxChars);
+  const candidateIndices = [...keepIndices].sort((a, b) => a - b);
+  const fullCandidatesText = renderSelectedIndices(lines, candidateIndices, true);
+  if (fullCandidatesText.length <= limit) {
+    return fullCandidatesText;
+  }
+  const tailOnly = packTailIndices(lines, candidateIndices, limit, true);
+  if (tailOnly.indices.length > 0 && tailOnly.indices[0] <= firstErrorLineIdx) {
+    return tailOnly.text;
+  }
+  if (firstErrorLineIdx === candidateIndices[candidateIndices.length - 1]) {
+    return compactSingleOversizedErrorLine(lines[firstErrorLineIdx], firstErrorLineIdx, limit);
+  }
+  const maxSepLen = `
+... (${lines.length} lines omitted) ...
+`.length;
+  const usableForSplit = Math.max(0, limit - maxSepLen);
+  const headBudget = Math.floor(usableForSplit * 0.28);
+  const firstPosInCandidates = candidateIndices.indexOf(firstErrorLineIdx);
+  const headIndices = [];
+  if (headBudget >= 24 && firstPosInCandidates !== -1) {
+    const prevIdx = firstErrorLineIdx - 1;
+    const leadIfPrev = prevIdx > 0 ? `... (${prevIdx} lines omitted) ...
+`.length : 0;
+    const prevLine = prevIdx >= 0 ? lines[prevIdx] : "";
+    const firstLine = lines[firstErrorLineIdx];
+    if (prevIdx >= 0 && prevLine.length <= Math.floor(headBudget * 0.35) && leadIfPrev + prevLine.length + 1 + firstLine.length <= headBudget) {
+      headIndices.push(prevIdx);
+    }
+    for (let pos = firstPosInCandidates; pos < candidateIndices.length; pos++) {
+      const idx = candidateIndices[pos];
+      if (headIndices.length > 0 && idx > headIndices[headIndices.length - 1] + 1) {
+        break;
+      }
+      const trial = [...headIndices, idx];
+      const rendered = renderSelectedIndices(lines, trial, true);
+      if (rendered.length <= headBudget) {
+        headIndices.push(idx);
+      } else {
+        break;
+      }
+    }
+  }
+  let headText = "";
+  let headLastIdx = -1;
+  if (headIndices.length > 0) {
+    headText = renderSelectedIndices(lines, headIndices, true);
+    headLastIdx = headIndices[headIndices.length - 1];
+  } else if (headBudget >= 12) {
+    const leadPrefix = firstErrorLineIdx > 0 ? `... (${firstErrorLineIdx} lines omitted) ...
+` : "";
+    const avail = headBudget - leadPrefix.length;
+    if (avail > 6) {
+      headText = `${leadPrefix}${sliceSafeChars(lines[firstErrorLineIdx], avail - 3)}...`;
+    } else {
+      headText = `${sliceSafeChars(lines[firstErrorLineIdx], Math.max(0, headBudget - 3))}...`;
+    }
+    headLastIdx = firstErrorLineIdx;
+  }
+  if (!headText) {
+    if (tailOnly.text) return tailOnly.text;
+    return `...${sliceTailSafeChars(lines[lines.length - 1], limit - 3)}`;
+  }
+  const remainingCandidates = candidateIndices.filter((idx) => idx > headLastIdx);
+  const tailBudget = Math.max(0, limit - headText.length - maxSepLen);
+  const tailPacked = packTailIndices(lines, remainingCandidates, tailBudget, false);
+  if (tailPacked.indices.length > 0) {
+    const omitted = tailPacked.indices[0] - headLastIdx - 1;
+    const sep = omitted > 0 ? `
+... (${omitted} lines omitted) ...
+` : "\n";
+    const combinedResult = `${headText}${sep}${tailPacked.text}`;
+    return combinedResult.length <= limit ? combinedResult : sliceSafeChars(combinedResult, limit);
+  }
+  if (remainingCandidates.length > 0 && tailBudget > 6) {
+    const lastIdx = remainingCandidates[remainingCandidates.length - 1];
+    const omitted = lastIdx - headLastIdx - 1;
+    const sep = omitted > 0 ? `
+... (${omitted} lines omitted) ...
+` : "\n";
+    const availTail = limit - headText.length - sep.length;
+    if (availTail > 3) {
+      const tailSlice = `...${sliceTailSafeChars(lines[lastIdx], availTail - 3)}`;
+      const combinedResult = `${headText}${sep}${tailSlice}`;
+      return combinedResult.length <= limit ? combinedResult : sliceSafeChars(combinedResult, limit);
+    }
+  }
+  return headText.length <= limit ? headText : sliceSafeChars(headText, limit);
+}
+function formatCompactCommandOutputWithMeta(params) {
+  const out = normalizeTerminalOutput(params.stdout);
+  const err = normalizeTerminalOutput(params.stderr);
+  const combined = [out, err].filter(Boolean).join("\n");
+  const rawChars = combined.length;
+  const rawLines = combined ? combined.split("\n").length : 0;
+  if (params.error) {
+    const full = `spawn error: ${params.error}`;
+    const text2 = truncateWithNotice(full, params.maxChars);
+    return {
+      text: text2,
+      collapsedLines: 0,
+      truncated: text2 !== full,
+      rawLines,
+      rawChars
+    };
+  }
+  if (params.timedOut) {
+    const tail = getTailLines(combined, 20);
+    const body = tail ? `TIMED OUT
+${tail}` : "TIMED OUT (no output)";
+    const text2 = truncateWithNotice(body, params.maxChars);
+    return {
+      text: text2,
+      collapsedLines: 0,
+      truncated: text2 !== body || rawLines > 20,
+      rawLines,
+      rawChars
+    };
+  }
+  if (params.exitCode === 0) {
+    if (!combined) {
+      return {
+        text: "OK",
+        collapsedLines: 0,
+        truncated: false,
+        rawLines: 0,
+        rawChars: 0
+      };
+    }
+    const lines = combined.split("\n").map((l) => l.trim()).filter(Boolean);
+    const summaryLines = lines.filter((l) => SUMMARY_LINE_PATTERN.test(l));
+    const picked = summaryLines.length > 0 ? summaryLines.slice(-2) : lines.length <= 2 ? lines : [lines[lines.length - 1]];
+    const joined = picked.join(" | ");
+    const cap = Math.min(params.maxChars, 320);
+    const text2 = truncateWithNotice(joined, cap);
+    return {
+      text: text2,
+      collapsedLines: 0,
+      truncated: text2 !== joined,
+      rawLines,
+      rawChars
+    };
+  }
+  if (!combined) {
+    const fallback = `Exited with code ${params.exitCode ?? "unknown"}`;
+    const text2 = truncateWithNotice(fallback, params.maxChars);
+    return {
+      text: text2,
+      collapsedLines: 0,
+      truncated: text2 !== fallback,
+      rawLines: 0,
+      rawChars: 0
+    };
+  }
+  const splitLines = combined.split("\n");
+  const filteredLines = splitLines.filter((line) => !isFailureNoiseLine(line));
+  const cleanedLines = filteredLines.length > 0 ? filteredLines : splitLines;
+  const { lines: foldedLines, collapsedLines } = foldGreenBuildPhaseLines(cleanedLines);
+  const foldedCombined = foldedLines.join("\n");
+  if (foldedCombined.length <= params.maxChars) {
+    return {
+      text: foldedCombined,
+      collapsedLines,
+      truncated: false,
+      rawLines,
+      rawChars
+    };
+  }
+  const text = compactLongFailureLines(foldedLines, params.maxChars);
+  return {
+    text,
+    collapsedLines,
+    truncated: true,
+    rawLines,
+    rawChars
+  };
+}
+function formatCompactCommandOutput(params) {
+  return formatCompactCommandOutputWithMeta(params).text;
 }
 function getTailLines(text, count) {
   if (!text) return "";
@@ -5188,115 +5544,525 @@ function extractCssSymbols(lines, compactOnly = false) {
   }
   return symbols;
 }
-function extractSfcSymbols(lines) {
-  const symbols = [];
-  const blockOpenRe = /^<(script|template|style)\b([^>]*)>/i;
+var HTML_VOID_ELEMENTS = /* @__PURE__ */ new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "param",
+  "source",
+  "track",
+  "wbr"
+]);
+var HTML_SEMANTIC_TAGS = /* @__PURE__ */ new Set([
+  "head",
+  "body",
+  "header",
+  "nav",
+  "main",
+  "aside",
+  "section",
+  "article",
+  "footer",
+  "form",
+  "dialog",
+  "template"
+]);
+var HTML_CONTAINER_TAGS = /* @__PURE__ */ new Set([
+  "div",
+  "ul",
+  "ol",
+  "table",
+  "fieldset",
+  "details"
+]);
+var COMPONENT_LANDMARK_RE = /^[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel|Tab|View|Page|Form)$/;
+var MAX_HTML_DEPTH = 2;
+function dedentLines(lines) {
+  let minIndent = Infinity;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const ws = /^[ \t]*/.exec(line)?.[0] ?? "";
+    if (ws.length < minIndent) minIndent = ws.length;
+    if (minIndent === 0) return lines;
+  }
+  if (!Number.isFinite(minIndent) || minIndent <= 0) return lines;
+  return lines.map((line) => line.trim() ? line.slice(minIndent) : "");
+}
+function findMatchingBrace2(text, start, maxLookahead = 2e3) {
+  const limit = Math.min(text.length, start + maxLookahead);
+  let depth = 0;
+  let quote = null;
+  let escape = false;
+  for (let i = start; i < limit; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote) {
+      if (ch === "\\") {
+        escape = true;
+      } else if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+function parseHtmlAttrs(attrText) {
+  const attrs = /* @__PURE__ */ new Map();
+  let vueSlot;
   let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const m = blockOpenRe.exec(line.trim());
-    if (!m || !m[1] || line.startsWith("  ") || line.startsWith("	")) {
+  const len = attrText.length;
+  while (i < len) {
+    while (i < len && /[\s/]/.test(attrText[i])) i++;
+    if (i >= len) break;
+    const nameStart = i;
+    while (i < len && !/[\s=/>"'`]/.test(attrText[i])) i++;
+    const rawName = attrText.slice(nameStart, i);
+    if (!rawName) {
       i++;
       continue;
     }
-    const tag = m[1].toLowerCase();
-    const attrs = (m[2] ?? "").trim();
-    const startIdx = i;
-    let endIdx = i;
-    if (tag === "template") {
-      let depth = 0;
-      const openTemplateRe = /<template\b[^>]*>/gi;
-      const closeTemplateRe = /<\/template\s*>/gi;
-      for (let j = i; j < lines.length; j++) {
-        const ln = lines[j];
-        const opens = ln.match(openTemplateRe)?.length ?? 0;
-        const closes = ln.match(closeTemplateRe)?.length ?? 0;
-        depth += opens - closes;
-        if (depth <= 0) {
-          endIdx = j;
+    const lowerName = rawName.toLowerCase();
+    if (!vueSlot && rawName.startsWith("#") && rawName.length > 1) {
+      vueSlot = rawName.slice(1);
+    } else if (!vueSlot && lowerName.startsWith("v-slot:") && rawName.length > 7) {
+      vueSlot = rawName.slice(7);
+    }
+    while (i < len && /\s/.test(attrText[i])) i++;
+    let value = "";
+    if (i < len && attrText[i] === "=") {
+      i++;
+      while (i < len && /\s/.test(attrText[i])) i++;
+      if (i < len) {
+        const ch = attrText[i];
+        if (ch === '"' || ch === "'") {
+          const quote = ch;
+          i++;
+          const valStart = i;
+          while (i < len && attrText[i] !== quote) i++;
+          value = attrText.slice(valStart, i);
+          if (i < len) i++;
+        } else if (ch === "{") {
+          const endBrace = findMatchingBrace2(attrText, i);
+          if (endBrace >= 0) {
+            value = attrText.slice(i, endBrace + 1);
+            i = endBrace + 1;
+          } else {
+            const valStart = i;
+            while (i < len && !/[\s/>]/.test(attrText[i])) i++;
+            value = attrText.slice(valStart, i);
+          }
+        } else {
+          const valStart = i;
+          while (i < len && !/[\s/>]/.test(attrText[i])) i++;
+          value = attrText.slice(valStart, i);
+        }
+      }
+    }
+    if (!attrs.has(lowerName)) {
+      attrs.set(lowerName, value);
+    }
+  }
+  return { attrs, vueSlot };
+}
+function formatHtmlTagLabel(displayTag, lowerTag, rawAttrs, parsed) {
+  if (lowerTag === "script" || lowerTag === "style") {
+    const compact = rawAttrs.replace(/\s+/g, " ").trim();
+    return compact ? `<${lowerTag} ${sliceSafeChars(compact, 40)}>` : `<${lowerTag}>`;
+  }
+  const idVal = parsed.attrs.get("id")?.trim();
+  if (idVal) {
+    return `<${displayTag} #${sliceSafeChars(idVal, 36)}>`;
+  }
+  const testIdVal = parsed.attrs.get("data-testid")?.trim();
+  if (testIdVal) {
+    return `<${displayTag} data-testid="${sliceSafeChars(testIdVal, 36)}">`;
+  }
+  const roleVal = parsed.attrs.get("role")?.trim();
+  if (roleVal) {
+    return `<${displayTag} role="${sliceSafeChars(roleVal, 36)}">`;
+  }
+  if (lowerTag === "template" && parsed.vueSlot) {
+    return `<template #${sliceSafeChars(parsed.vueSlot, 36)}>`;
+  }
+  return `<${displayTag}>`;
+}
+function isJsScriptType(typeAttr) {
+  if (typeAttr === void 0) return true;
+  const mime = typeAttr.trim().toLowerCase().split(";")[0]?.trim() ?? "";
+  return !mime || mime === "module" || mime === "text/javascript" || mime === "application/javascript" || mime === "text/ecmascript" || mime === "application/ecmascript" || mime === "text/typescript" || mime === "ts" || mime === "tsx" || mime === "jsx";
+}
+function isCommentDecorChar(ch) {
+  return ch === "=" || ch === "-" || ch === "*" || ch === "#" || ch === "~" || ch === ":" || ch === " " || ch === "	" || ch === "\r" || ch === "\n";
+}
+function extractCommentLandmark(inner) {
+  let start = 0;
+  let end = inner.length;
+  while (start < end && isCommentDecorChar(inner[start])) start++;
+  while (end > start && isCommentDecorChar(inner[end - 1])) end--;
+  const cleaned = inner.slice(start, end);
+  if (cleaned.length < 2 || cleaned.length > 60) return null;
+  if (/[<>]/.test(cleaned)) return null;
+  if (/^(?:eslint|prettier|istanbul|c8|v8|@ts-)/i.test(cleaned)) return null;
+  if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(cleaned)) return null;
+  return cleaned;
+}
+function extractTemplateSymbols(rawLines, lineOffset = 0, baseDepth = 0) {
+  if (rawLines.length === 0) return [];
+  const lines = rawLines[0].startsWith("\uFEFF") ? [rawLines[0].slice(1), ...rawLines.slice(1)] : rawLines;
+  const text = lines.join("\n");
+  const lineStarts = new Array(lines.length);
+  let acc = 0;
+  for (let idx = 0; idx < lines.length; idx++) {
+    lineStarts[idx] = acc;
+    acc += lines[idx].length + 1;
+  }
+  const offsetToLineIdx = (pos) => {
+    let lo = 0;
+    let hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = lo + hi + 1 >> 1;
+      if (lineStarts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  const symbols = [];
+  const stack = [];
+  let emittedCount = 0;
+  let noCloseSingle = false;
+  let noCloseDouble = false;
+  let i = 0;
+  const len = text.length;
+  while (i < len) {
+    const lt = text.indexOf("<", i);
+    if (lt < 0) break;
+    i = lt;
+    if (text.startsWith("<!--", i)) {
+      const startLineIdx2 = offsetToLineIdx(i);
+      const closePos = text.indexOf("-->", i + 4);
+      if (closePos < 0) {
+        break;
+      }
+      const endLineIdx = offsetToLineIdx(closePos + 2);
+      if (startLineIdx2 === endLineIdx) {
+        const lineTrim = lines[startLineIdx2].trim();
+        if (lineTrim.startsWith("<!--") && lineTrim.endsWith("-->") && lineTrim.indexOf("-->", 4) === lineTrim.length - 3) {
+          const landmark = extractCommentLandmark(text.slice(i + 4, closePos));
+          if (landmark) {
+            const ln = lineOffset + startLineIdx2 + 1;
+            symbols.push({
+              kind: "section",
+              name: landmark,
+              startLine: ln,
+              endLine: ln,
+              depth: Math.min(MAX_HTML_DEPTH, baseDepth + emittedCount)
+            });
+          }
+        }
+      }
+      i = closePos + 3;
+      continue;
+    }
+    if (text.startsWith("<![CDATA[", i)) {
+      const closePos = text.indexOf("]]>", i + 9);
+      i = closePos < 0 ? len : closePos + 3;
+      continue;
+    }
+    const nextCh = text[i + 1];
+    if (nextCh === "!" || nextCh === "?") {
+      let quote2 = null;
+      let j2 = i + 2;
+      while (j2 < len) {
+        const c = text[j2];
+        if (quote2) {
+          if (c === quote2) quote2 = null;
+        } else if (c === '"' || c === "'") {
+          quote2 = c;
+        } else if (c === ">") {
+          j2++;
           break;
         }
-        endIdx = j;
+        j2++;
       }
-    } else {
-      const closeRe = new RegExp(`</${tag}\\s*>`, "i");
-      for (let j = i; j < lines.length; j++) {
-        endIdx = j;
-        if (j > i && closeRe.test(lines[j])) break;
-        if (j === i && closeRe.test(lines[j].slice(m[0].length))) break;
-      }
+      i = j2;
+      continue;
     }
-    const headerLabel = attrs ? `<${tag} ${attrs.slice(0, 40)}>` : `<${tag}>`;
-    symbols.push({
-      kind: tag,
-      name: headerLabel,
-      startLine: startIdx + 1,
-      endLine: endIdx + 1,
-      depth: 0
-    });
-    const innerStart = startIdx + 1;
-    const innerLines = lines.slice(innerStart, endIdx);
-    if (tag === "script" && innerLines.length > 0) {
-      const innerSyms = extractTsJsSymbols(innerLines);
-      for (const s of innerSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: s.depth + 1
-        });
+    if (nextCh === "/") {
+      const nameStart = i + 2;
+      if (nameStart >= len || !/[A-Za-z]/.test(text[nameStart])) {
+        i += 2;
+        continue;
       }
-    } else if (tag === "template" && innerLines.length >= 30) {
-      let landmarks = 0;
-      const commentLandmarkRe = /^<!--\s*[=\-*#]*\s*([^-][^>]{2,60}?)\s*[=\-*#]*\s*-->$/;
-      const semanticTagRe = /^<(header|nav|main|aside|section|footer|dialog|form|[A-Z][A-Za-z0-9]*(?:Modal|Drawer|Dialog|Panel))\b([^>]*)>/;
-      for (let k = 0; k < innerLines.length && landmarks < 14; k++) {
-        const raw = innerLines[k];
-        const indent = raw.length - raw.trimStart().length;
-        if (indent > 8) continue;
-        const trimmed = raw.trim();
-        const cm = commentLandmarkRe.exec(trimmed);
-        if (cm && cm[1]) {
-          symbols.push({
-            kind: "section",
-            name: cm[1].trim(),
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
+      let j2 = nameStart + 1;
+      while (j2 < len && /[A-Za-z0-9:._-]/.test(text[j2])) j2++;
+      const closeLowerTag = text.slice(nameStart, j2).toLowerCase();
+      while (j2 < len && text[j2] !== ">") j2++;
+      if (j2 < len && text[j2] === ">") j2++;
+      const closeLine = lineOffset + offsetToLineIdx(Math.max(i, j2 - 1)) + 1;
+      let matchIdx = -1;
+      for (let s = stack.length - 1; s >= 0; s--) {
+        if (stack[s].lowerTag === closeLowerTag) {
+          matchIdx = s;
+          break;
+        }
+      }
+      if (matchIdx >= 0) {
+        for (let s = stack.length - 1; s > matchIdx; s--) {
+          const unclosed = stack.pop();
+          if (unclosed.emitted) {
+            emittedCount = Math.max(0, emittedCount - 1);
+            if (unclosed.symbol) {
+              unclosed.symbol.endLine = Math.max(
+                unclosed.startLine,
+                closeLine > unclosed.startLine ? closeLine - 1 : unclosed.startLine
+              );
+            }
+          }
+        }
+        const matched = stack.pop();
+        if (matched.emitted) {
+          emittedCount = Math.max(0, emittedCount - 1);
+          if (matched.symbol) {
+            matched.symbol.endLine = Math.max(matched.startLine, closeLine);
+          }
+        }
+      }
+      i = j2;
+      continue;
+    }
+    if (!nextCh || !/[A-Za-z]/.test(nextCh)) {
+      i++;
+      continue;
+    }
+    const tagStart = i;
+    let nameEnd = i + 1;
+    while (nameEnd < len && /[A-Za-z0-9:._-]/.test(text[nameEnd])) nameEnd++;
+    const afterNameCh = text[nameEnd];
+    if (afterNameCh !== void 0 && !/[\s/>]/.test(afterNameCh)) {
+      i = nameEnd;
+      continue;
+    }
+    const rawTag = text.slice(i + 1, nameEnd);
+    const lowerTag = rawTag.toLowerCase();
+    let j = nameEnd;
+    let quote = null;
+    let lastUnquotedNonWs = "";
+    let foundGt = false;
+    while (j < len) {
+      const c = text[j];
+      if (quote) {
+        if (c === quote) quote = null;
+        j++;
+        continue;
+      }
+      if ((c === '"' || c === "'") && lastUnquotedNonWs === "=") {
+        if (c === '"' && !noCloseDouble || c === "'" && !noCloseSingle) {
+          quote = c;
+        }
+        lastUnquotedNonWs = c;
+        j++;
+        continue;
+      }
+      if (c === "{") {
+        const endBrace = findMatchingBrace2(text, j);
+        if (endBrace >= 0) {
+          lastUnquotedNonWs = "}";
+          j = endBrace + 1;
           continue;
         }
-        const sm = semanticTagRe.exec(trimmed);
-        if (sm && sm[1]) {
-          const attrStr = sm[2] ?? "";
-          const idMatch = /(?:data-testid|id|class)=["']([^"']+)["']/.exec(attrStr);
-          const tagDesc = idMatch && idMatch[1] ? `<${sm[1]} ${idMatch[1].slice(0, 36)}>` : `<${sm[1]}>`;
-          symbols.push({
-            kind: "block",
-            name: tagDesc,
-            startLine: innerStart + k + 1,
-            endLine: innerStart + k + 1,
-            depth: 1
-          });
-          landmarks++;
+      }
+      if (c === "<") {
+        foundGt = false;
+        break;
+      }
+      if (c === ">") {
+        foundGt = true;
+        break;
+      }
+      if (!/\s/.test(c)) {
+        lastUnquotedNonWs = c;
+      }
+      j++;
+    }
+    if (!foundGt) {
+      if (quote === '"') noCloseDouble = true;
+      else if (quote === "'") noCloseSingle = true;
+      i = tagStart + 1;
+      continue;
+    }
+    const gtPos = j;
+    const selfClosing = lastUnquotedNonWs === "/";
+    const rawAttrSlice = text.slice(
+      nameEnd,
+      selfClosing ? text.lastIndexOf("/", gtPos) : gtPos
+    );
+    const startLineIdx = offsetToLineIdx(tagStart);
+    const openEndLineIdx = offsetToLineIdx(gtPos);
+    const startLine = lineOffset + startLineIdx + 1;
+    const openEndLine = lineOffset + openEndLineIdx + 1;
+    if (lowerTag === "script" || lowerTag === "style") {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const tagDepth = Math.min(MAX_HTML_DEPTH, baseDepth + emittedCount);
+      const label = formatHtmlTagLabel(lowerTag, lowerTag, rawAttrSlice, parsed);
+      if (selfClosing) {
+        symbols.push({
+          kind: lowerTag,
+          name: label,
+          startLine,
+          endLine: openEndLine,
+          depth: tagDepth
+        });
+        i = gtPos + 1;
+        continue;
+      }
+      const closeRe = new RegExp(`</${lowerTag}\\s*>`, "gi");
+      closeRe.lastIndex = gtPos + 1;
+      const closeMatch = closeRe.exec(text);
+      let closeStart;
+      let endLine;
+      let nextPos;
+      if (closeMatch) {
+        closeStart = closeMatch.index;
+        const closeEndPos = closeMatch.index + closeMatch[0].length;
+        endLine = Math.max(startLine, lineOffset + offsetToLineIdx(closeEndPos - 1) + 1);
+        nextPos = closeEndPos;
+      } else if (lowerTag === "script" && parsed.attrs.has("src")) {
+        closeStart = gtPos + 1;
+        endLine = openEndLine;
+        nextPos = gtPos + 1;
+      } else {
+        closeStart = len;
+        endLine = Math.max(startLine, lineOffset + lines.length);
+        nextPos = len;
+      }
+      symbols.push({
+        kind: lowerTag,
+        name: label,
+        startLine,
+        endLine,
+        depth: tagDepth
+      });
+      const shouldRecurse = closeStart > gtPos + 1 && (lowerTag === "style" || !parsed.attrs.has("src") && isJsScriptType(parsed.attrs.get("type")));
+      if (shouldRecurse) {
+        const closeLineIdx = offsetToLineIdx(
+          closeStart < len ? closeStart : Math.max(0, len - 1)
+        );
+        const innerLines = [];
+        let innerBaseLineIdx;
+        if (openEndLineIdx === closeLineIdx) {
+          innerBaseLineIdx = openEndLineIdx;
+          const singleInner = text.slice(gtPos + 1, closeStart);
+          if (singleInner.trim()) {
+            innerLines.push(singleInner);
+          }
+        } else {
+          const openLineEnd = openEndLineIdx + 1 < lineStarts.length ? lineStarts[openEndLineIdx + 1] - 1 : len;
+          const firstRest = text.slice(gtPos + 1, openLineEnd);
+          if (firstRest.trim()) {
+            innerBaseLineIdx = openEndLineIdx;
+            innerLines.push(firstRest);
+          } else {
+            innerBaseLineIdx = openEndLineIdx + 1;
+          }
+          for (let li = openEndLineIdx + 1; li < closeLineIdx; li++) {
+            innerLines.push(lines[li]);
+          }
+          if (closeStart < len) {
+            const lastPrefix = text.slice(lineStarts[closeLineIdx], closeStart);
+            if (lastPrefix.trim()) {
+              innerLines.push(lastPrefix);
+            }
+          } else if (closeLineIdx >= openEndLineIdx + 1) {
+            innerLines.push(lines[closeLineIdx]);
+          }
+        }
+        if (innerLines.some((l) => l.trim().length > 0)) {
+          const dedented = dedentLines(innerLines);
+          const innerSyms = lowerTag === "script" ? extractTsJsSymbols(dedented) : extractCssSymbols(dedented, true);
+          const childLineOffset = lineOffset + innerBaseLineIdx;
+          for (const s of innerSyms) {
+            const childStart = s.startLine + childLineOffset;
+            const childEnd = Math.max(childStart, s.endLine + childLineOffset);
+            symbols.push({
+              kind: s.kind,
+              name: s.name,
+              startLine: childStart,
+              endLine: childEnd,
+              depth: Math.min(MAX_HTML_DEPTH, tagDepth + 1 + s.depth)
+            });
+          }
         }
       }
-    } else if (tag === "style" && innerLines.length > 0) {
-      const cssSyms = extractCssSymbols(innerLines, true).slice(0, 12);
-      for (const s of cssSyms) {
-        symbols.push({
-          kind: s.kind,
-          name: s.name,
-          startLine: s.startLine + innerStart,
-          endLine: s.endLine + innerStart,
-          depth: 1
-        });
+      i = nextPos;
+      continue;
+    }
+    const isVoid = HTML_VOID_ELEMENTS.has(lowerTag);
+    const isComponent = COMPONENT_LANDMARK_RE.test(rawTag);
+    const isSemantic = HTML_SEMANTIC_TAGS.has(lowerTag);
+    const isContainer = HTML_CONTAINER_TAGS.has(lowerTag);
+    let shouldEmit = false;
+    let emittedSymbol;
+    if (isComponent || isSemantic || isContainer) {
+      const parsed = parseHtmlAttrs(rawAttrSlice);
+      const hasIdentityAttr = Boolean(parsed.attrs.get("id")?.trim()) || Boolean(parsed.attrs.get("data-testid")?.trim()) || Boolean(parsed.attrs.get("role")?.trim());
+      if (isComponent || isSemantic || isContainer && hasIdentityAttr) {
+        shouldEmit = true;
+        const displayTag = isComponent ? rawTag : lowerTag;
+        const kind = lowerTag === "template" ? "template" : isComponent ? "component" : "block";
+        emittedSymbol = {
+          kind,
+          name: formatHtmlTagLabel(displayTag, lowerTag, rawAttrSlice, parsed),
+          startLine,
+          endLine: openEndLine,
+          depth: Math.min(MAX_HTML_DEPTH, baseDepth + emittedCount)
+        };
+        symbols.push(emittedSymbol);
       }
     }
-    i = endIdx + 1;
+    if (!selfClosing && !isVoid) {
+      stack.push({
+        lowerTag,
+        startLine,
+        emitted: shouldEmit,
+        symbol: emittedSymbol
+      });
+      if (shouldEmit) emittedCount++;
+    }
+    i = gtPos + 1;
   }
+  const eofLine = lineOffset + lines.length;
+  while (stack.length > 0) {
+    const frame = stack.pop();
+    if (frame.emitted && frame.symbol) {
+      frame.symbol.endLine = Math.max(frame.startLine, eofLine);
+    }
+  }
+  return symbols;
+}
+function extractHtmlSymbols(lines) {
+  return extractTemplateSymbols(lines, 0, 0);
+}
+function extractSfcSymbols(lines) {
+  const symbols = extractTemplateSymbols(lines, 0, 0);
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
@@ -5311,6 +6077,9 @@ function extractSymbolsFromLines(filePath, lines) {
     case ".mjs":
     case ".cjs":
       return extractTsJsSymbols(lines);
+    case ".html":
+    case ".htm":
+      return extractHtmlSymbols(lines);
     case ".vue":
     case ".svelte":
       return extractSfcSymbols(lines);
@@ -5359,16 +6128,142 @@ var MAX_OUTLINES = 40;
 var MAX_SLICE_FILES = 30;
 var SLICE_TRUNCATION_TIP = "\n[tip: MCP responses are hard-capped <=8.8KB inline; for >150 lines across files, use parallel read_file(StartLine, EndLine) (46KB/call, 0 remote check)]";
 var OUTLINE_BATCH_TIP = "\n[tip: outlining >20 files splits the 8.8KB cap thinly; batch 10-20 files per call for fuller outlines]";
-function selectOutlineSymbols(symbols, limit) {
-  if (symbols.length <= limit) return symbols;
-  const keptIndices = /* @__PURE__ */ new Set();
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    if (symbols[i].depth === 0) keptIndices.add(i);
+function formatSymbolLine(s) {
+  const indent = "  ".repeat(s.depth);
+  const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
+  return `${indent}${span} [${s.kind}] ${s.name}`;
+}
+function formatNestedOmissionFooter(omittedNested) {
+  return `
+... (+${omittedNested} nested symbols omitted)`;
+}
+function formatTopLevelOmissionFooter(omittedTop, minStart, maxEnd) {
+  return `
+... (+${omittedTop} more top-level symbols in L${minStart}-L${maxEnd} omitted; use batch_search or read_file)`;
+}
+function packOutlineToBudget(header, symbols, charBudget, byteBudget) {
+  const items = symbols.map((sym) => {
+    const line = formatSymbolLine(sym);
+    return {
+      line,
+      chars: line.length + 1,
+      // +1 for leading '\n'
+      bytes: Buffer.byteLength(line, "utf8") + 1
+    };
+  });
+  const headerChars = header.length;
+  const headerBytes = Buffer.byteLength(header, "utf8");
+  let fullChars = headerChars;
+  let fullBytes = headerBytes;
+  for (const item of items) {
+    fullChars += item.chars;
+    fullBytes += item.bytes;
   }
-  for (let i = 0; i < symbols.length && keptIndices.size < limit; i++) {
-    keptIndices.add(i);
+  if (fullChars <= charBudget && fullBytes <= byteBudget) {
+    return `${header}
+${items.map((it) => it.line).join("\n")}`;
   }
-  return [...keptIndices].sort((a, b) => a - b).map((idx) => symbols[idx]);
+  const byDepth = /* @__PURE__ */ new Map();
+  for (let idx = 0; idx < symbols.length; idx++) {
+    const d = symbols[idx].depth;
+    let list = byDepth.get(d);
+    if (!list) {
+      list = [];
+      byDepth.set(d, list);
+    }
+    list.push(idx);
+  }
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  const topDepth = depths[0] ?? 0;
+  const topIndices = byDepth.get(topDepth) ?? [];
+  const nestedTotalCount = symbols.length - topIndices.length;
+  let topChars = headerChars;
+  let topBytes = headerBytes;
+  for (const idx of topIndices) {
+    topChars += items[idx].chars;
+    topBytes += items[idx].bytes;
+  }
+  if (nestedTotalCount > 0) {
+    const worstNestedFooterLen = formatNestedOmissionFooter(nestedTotalCount).length;
+    if (topChars + worstNestedFooterLen <= charBudget && topBytes + worstNestedFooterLen <= byteBudget) {
+      const selected = new Set(topIndices);
+      let usedChars2 = topChars;
+      let usedBytes2 = topBytes;
+      let omittedNested = nestedTotalCount;
+      let stopped = false;
+      for (const d of depths) {
+        if (d === topDepth) continue;
+        if (stopped) break;
+        const indices = byDepth.get(d);
+        for (const idx of indices) {
+          const item = items[idx];
+          const nextOmitted = omittedNested - 1;
+          const nextFooterLen = nextOmitted > 0 ? formatNestedOmissionFooter(nextOmitted).length : 0;
+          if (usedChars2 + item.chars + nextFooterLen <= charBudget && usedBytes2 + item.bytes + nextFooterLen <= byteBudget) {
+            selected.add(idx);
+            usedChars2 += item.chars;
+            usedBytes2 += item.bytes;
+            omittedNested = nextOmitted;
+          } else {
+            stopped = true;
+            break;
+          }
+        }
+      }
+      const ordered = [...selected].sort((a, b) => a - b);
+      const footer2 = omittedNested > 0 ? formatNestedOmissionFooter(omittedNested) : "";
+      if (ordered.length === 0) {
+        return `${header}${footer2}`;
+      }
+      return `${header}
+${ordered.map((idx) => items[idx].line).join("\n")}${footer2}`;
+    }
+  }
+  const m = topIndices.length;
+  const suffixMinStart = new Array(m);
+  const suffixMaxEnd = new Array(m);
+  for (let k = m - 1; k >= 0; k--) {
+    const sym = symbols[topIndices[k]];
+    if (k === m - 1) {
+      suffixMinStart[k] = sym.startLine;
+      suffixMaxEnd[k] = sym.endLine;
+    } else {
+      suffixMinStart[k] = Math.min(sym.startLine, suffixMinStart[k + 1]);
+      suffixMaxEnd[k] = Math.max(sym.endLine, suffixMaxEnd[k + 1]);
+    }
+  }
+  let usedChars = headerChars;
+  let usedBytes = headerBytes;
+  let pickedCount = 0;
+  for (let k = 0; k < m; k++) {
+    const nextOmitted = m - (k + 1);
+    if (nextOmitted === 0) break;
+    const item = items[topIndices[k]];
+    const nextFooterLen = formatTopLevelOmissionFooter(
+      nextOmitted,
+      suffixMinStart[k + 1],
+      suffixMaxEnd[k + 1]
+    ).length;
+    if (usedChars + item.chars + nextFooterLen <= charBudget && usedBytes + item.bytes + nextFooterLen <= byteBudget) {
+      usedChars += item.chars;
+      usedBytes += item.bytes;
+      pickedCount = k + 1;
+    } else {
+      break;
+    }
+  }
+  const omittedTopCount = m - pickedCount;
+  const footer = formatTopLevelOmissionFooter(
+    omittedTopCount,
+    suffixMinStart[pickedCount],
+    suffixMaxEnd[pickedCount]
+  );
+  if (pickedCount === 0) {
+    return `${header}${footer}`;
+  }
+  const pickedLines = topIndices.slice(0, pickedCount).map((idx) => items[idx].line);
+  return `${header}
+${pickedLines.join("\n")}${footer}`;
 }
 async function runReadSlices(input) {
   const corruptedItems = [];
@@ -5468,7 +6363,6 @@ async function runReadSlices(input) {
   const rawMaxChars = Number(input.maxChars ?? 8500);
   const maxChars = Number.isFinite(rawMaxChars) ? Math.max(1e3, Math.min(DEFAULT_INLINE_MAX_BYTES, Math.trunc(rawMaxChars))) : 8500;
   const maxBytes = DEFAULT_INLINE_MAX_BYTES;
-  const perFileSymbolLimit = outlines.length <= 1 ? 120 : outlines.length <= 4 ? 60 : outlines.length <= 10 ? 30 : outlines.length <= 20 ? 16 : 10;
   const fileCache = /* @__PURE__ */ new Map();
   async function loadLines(absPath) {
     const cached = fileCache.get(absPath);
@@ -5479,7 +6373,7 @@ async function runReadSlices(input) {
     fileCache.set(absPath, entry);
     return entry;
   }
-  const sections = [];
+  const sectionEntries = [];
   if (outlines.length > 0) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
@@ -5488,40 +6382,50 @@ async function runReadSlices(input) {
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
+          const header = `## Outline: ${relPath} (${lines.length} lines)`;
           if (symbols.length === 0) {
-            return `## Outline: ${relPath} (${lines.length} lines)
-(no top-level symbols detected)`;
+            return {
+              kind: "static",
+              fullText: `${header}
+(no top-level symbols detected)`
+            };
           }
-          const picked = selectOutlineSymbols(symbols, perFileSymbolLimit);
-          const formatted = picked.map((s) => {
-            const indent = "  ".repeat(s.depth);
-            const span = s.endLine > s.startLine ? `L${s.startLine}-L${s.endLine}` : `L${s.startLine}`;
-            return `${indent}${span} [${s.kind}] ${s.name}`;
-          });
-          const extra = symbols.length > picked.length ? outlines.length > 10 ? `
-... (+${symbols.length - picked.length} more symbols)` : `
-... (${symbols.length - picked.length} more symbols omitted; outline this file alone for full list)` : "";
-          return `## Outline: ${relPath} (${lines.length} lines)
-${formatted.join("\n")}${extra}`;
+          const formatted = symbols.map(formatSymbolLine);
+          return {
+            kind: "outline",
+            header,
+            symbols,
+            fullText: `${header}
+${formatted.join("\n")}`
+          };
         } catch (err) {
-          return `## Outline: ${relPath}
-ERROR: ${err instanceof Error ? err.message : String(err)}`;
+          return {
+            kind: "static",
+            fullText: `## Outline: ${relPath}
+ERROR: ${err instanceof Error ? err.message : String(err)}`
+          };
         }
       })
     );
-    sections.push(...outlineResults);
+    sectionEntries.push(...outlineResults);
   }
   if (slices.length > 0) {
     const sliceResults = await Promise.all(
       slices.map(async (req) => {
         if (!req || typeof req.path !== "string" || !req.path.trim()) {
-          return "## Slice: (invalid)\nERROR: 'path' must be a non-empty string";
+          return {
+            kind: "static",
+            fullText: "## Slice: (invalid)\nERROR: 'path' must be a non-empty string"
+          };
         }
         const absPath = resolvePath(req.path, baseCwd);
         const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
-          return `## Slice: ${relPath}
-ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath}
+ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`
+          };
         }
         try {
           const { lines } = await loadLines(absPath);
@@ -5560,35 +6464,67 @@ ERROR: 'ranges' must be a non-empty array of [startLine, endLine] pairs`;
             }
             blocks.push(snippet.join("\n"));
           }
-          return `## Slice: ${relPath} (${totalLines} lines)
-${blocks.join("\n")}`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath} (${totalLines} lines)
+${blocks.join("\n")}`
+          };
         } catch (err) {
-          return `## Slice: ${relPath}
-ERROR: ${err instanceof Error ? err.message : String(err)}`;
+          return {
+            kind: "static",
+            fullText: `## Slice: ${relPath}
+ERROR: ${err instanceof Error ? err.message : String(err)}`
+          };
         }
       })
     );
-    sections.push(...sliceResults);
+    sectionEntries.push(...sliceResults);
   }
-  const rawJoined = sections.join("\n\n");
-  const rawBytes = Buffer.byteLength(rawJoined, "utf8");
-  const isOverBudget = rawJoined.length > maxChars || rawBytes > maxBytes;
-  const activeTip = isOverBudget && slices.length > 0 ? SLICE_TRUNCATION_TIP : isOverBudget && outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
-  if (activeTip && maxChars > activeTip.length + 200) {
-    const tipBytes = Buffer.byteLength(activeTip, "utf8");
-    const body = fitSectionsToByteBudget(
-      sections,
-      maxChars - activeTip.length,
-      maxBytes - tipBytes,
-      "\n\n"
-    );
+  const separator = "\n\n";
+  const sepChars = separator.length * Math.max(0, sectionEntries.length - 1);
+  const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, sectionEntries.length - 1);
+  const charSizes = sectionEntries.map((s) => s.fullText.length);
+  const byteSizes = sectionEntries.map(
+    (s) => Buffer.byteLength(s.fullText, "utf8")
+  );
+  const rawChars = charSizes.reduce((sum, n) => sum + n, 0) + sepChars;
+  const rawBytes = byteSizes.reduce((sum, n) => sum + n, 0) + sepBytes;
+  const isOverBudget = rawChars > maxChars || rawBytes > maxBytes;
+  if (!isOverBudget) {
     return {
-      text: `${body}${activeTip}`,
+      text: sectionEntries.map((s) => s.fullText).join(separator),
       isError: false
     };
   }
+  const activeTip = slices.length > 0 ? SLICE_TRUNCATION_TIP : outlines.length > 20 ? OUTLINE_BATCH_TIP : null;
+  const applyTip = activeTip !== null && maxChars > activeTip.length + 200;
+  const tipChars = applyTip ? activeTip.length : 0;
+  const tipBytes = applyTip ? Buffer.byteLength(activeTip, "utf8") : 0;
+  const bodyMaxChars = maxChars - tipChars;
+  const bodyMaxBytes = maxBytes - tipBytes;
+  const availChars = Math.max(0, bodyMaxChars - sepChars);
+  const availBytes = Math.max(0, bodyMaxBytes - sepBytes);
+  const charBudgets = computeWaterFillBudgets(charSizes, availChars);
+  const byteBudgets = computeWaterFillBudgets(byteSizes, availBytes);
+  const sections = sectionEntries.map((entry, idx) => {
+    if (entry.kind === "outline" && (charSizes[idx] > charBudgets[idx] || byteSizes[idx] > byteBudgets[idx])) {
+      return packOutlineToBudget(
+        entry.header,
+        entry.symbols,
+        charBudgets[idx],
+        byteBudgets[idx]
+      );
+    }
+    return entry.fullText;
+  });
+  const body = fitSectionsToByteBudget(
+    sections,
+    bodyMaxChars,
+    bodyMaxBytes,
+    separator
+  );
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: applyTip ? `${body}${activeTip}` : body,
     isError: false
   };
 }
@@ -5761,61 +6697,282 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     );
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
-  const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget = failedCount > 0 ? Math.max(
-    160,
-    Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount)
-  ) : 320;
-  const fullPerCmdBudget = Math.max(
-    160,
-    Math.floor(usableChars / outcomes.length)
+  const separator = "\n\n";
+  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - separator.length);
+  const bodyByteBudget = Math.max(
+    0,
+    maxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8")
   );
-  const blocks = outcomes.map(({ spec, result, passed }) => {
-    if (!result) return `## [NOT RUN] ${spec.name}
+  let blocks;
+  if (outputMode === "full") {
+    blocks = outcomes.map(({ spec, result, passed }) => {
+      if (!result) return `## [NOT RUN] ${spec.name}
 $ ${spec.command}`;
-    const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
-    if (outputMode === "full") {
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr)
       ].filter(Boolean).join("\n");
-      const body2 = result.error ? `spawn error: ${result.error}` : truncateWithNotice(combined || "(no output)", fullPerCmdBudget);
+      const body = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
       return `## [${badge}] ${spec.name} (${result.durationMs}ms)
 $ ${spec.command}
-${body2}`;
-    }
-    const body = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: passed ? 300 : failedBudget
-    });
-    if (passed) {
-      return `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
-    }
-    return `## [${badge} ${result.durationMs}ms] ${spec.name}
-$ ${spec.command}
 ${body}`;
-  });
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget = maxBytes !== void 0 ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2) : void 0;
+    });
+  } else {
+    blocks = new Array(outcomes.length);
+    const passEntries = [];
+    const failEntries = [];
+    let notRunChars = 0;
+    let notRunBytes = 0;
+    let passChars = 0;
+    let passBytes = 0;
+    for (let i = 0; i < outcomes.length; i++) {
+      const { spec, result, passed } = outcomes[i];
+      if (!result) {
+        const block = `## [NOT RUN] ${spec.name}
+$ ${spec.command}`;
+        blocks[i] = block;
+        notRunChars += block.length;
+        notRunBytes += Buffer.byteLength(block, "utf8");
+        continue;
+      }
+      if (passed) {
+        const body = formatCompactCommandOutput({
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          error: result.error,
+          maxChars: 300
+        });
+        const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
+        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
+        blocks[i] = fullBlock;
+        passChars += fullBlock.length;
+        passBytes += Buffer.byteLength(fullBlock, "utf8");
+        passEntries.push({ index: i, compactHeader, body, fullBlock });
+        continue;
+      }
+      const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}
+`;
+      const header = `${badgeLine}$ ${spec.command}
+`;
+      const pass1Ceiling = Math.max(
+        bodyBudget,
+        result.stdout.length + result.stderr.length + 256
+      );
+      const pass1Body = formatCompactCommandOutput({
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        error: result.error,
+        maxChars: pass1Ceiling
+      });
+      failEntries.push({
+        index: i,
+        spec,
+        result,
+        badgeLine,
+        header,
+        pass1Body,
+        pass1Block: `${header}${pass1Body}`
+      });
+    }
+    if (failEntries.length > 0) {
+      const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
+      const totalSepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
+      const availChars = Math.max(0, bodyBudget - totalSepChars);
+      const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
+      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
+      const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+      const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+      if (passEntries.length > 0) {
+        const minPassReserveChars = passEntries.reduce(
+          (sum, p) => sum + Math.min(p.fullBlock.length, p.compactHeader.length),
+          0
+        );
+        const minPassReserveBytes = passEntries.reduce(
+          (sum, p) => sum + Math.min(
+            Buffer.byteLength(p.fullBlock, "utf8"),
+            Buffer.byteLength(p.compactHeader, "utf8")
+          ),
+          0
+        );
+        const totalFailDemandChars = failEntries.reduce(
+          (sum, f) => sum + f.pass1Block.length,
+          0
+        );
+        const totalFailDemandBytes = failEntries.reduce(
+          (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
+          0
+        );
+        const failFloorChars = Math.max(
+          failEntries.reduce(
+            (sum, f) => sum + f.header.length + Math.min(f.pass1Body.length, 160),
+            0
+          ),
+          Math.floor(availAfterNotRunChars * 0.6)
+        );
+        const failFloorBytes = Math.max(
+          failEntries.reduce(
+            (sum, f) => sum + Buffer.byteLength(f.header, "utf8") + Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
+            0
+          ),
+          Math.floor(availAfterNotRunBytes * 0.6)
+        );
+        const desiredFailChars = Math.min(
+          totalFailDemandChars,
+          Math.max(0, availAfterNotRunChars - minPassReserveChars),
+          failFloorChars
+        );
+        const desiredFailBytes = Math.min(
+          totalFailDemandBytes,
+          Math.max(0, availAfterNotRunBytes - minPassReserveBytes),
+          failFloorBytes
+        );
+        if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
+          const passPoolChars = Math.max(
+            0,
+            availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars)
+          );
+          const passPoolBytes = Math.max(
+            0,
+            availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes)
+          );
+          const passCharShares = computeWaterFillBudgets(
+            passEntries.map((p) => p.fullBlock.length),
+            passPoolChars
+          );
+          const passByteShares = computeWaterFillBudgets(
+            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
+            passPoolBytes
+          );
+          passChars = 0;
+          passBytes = 0;
+          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
+            const p = passEntries[pIdx];
+            const shareChars = passCharShares[pIdx] ?? 0;
+            const shareBytes = passByteShares[pIdx] ?? 0;
+            let shrunk = p.fullBlock;
+            if (shrunk.length > shareChars || Buffer.byteLength(shrunk, "utf8") > shareBytes) {
+              const noCmd = `${p.compactHeader}: ${p.body}`;
+              if (noCmd.length <= shareChars && Buffer.byteLength(noCmd, "utf8") <= shareBytes) {
+                shrunk = noCmd;
+              } else {
+                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+                const bodyBytesAvail = shareBytes - hdrBytes - 2;
+                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+                  const trimmedBody = sliceUtf8Bytes(
+                    sliceSafeChars(p.body, bodyCharsAvail - 3),
+                    bodyBytesAvail - 3
+                  );
+                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
+                } else if (p.compactHeader.length <= shareChars && hdrBytes <= shareBytes) {
+                  shrunk = p.compactHeader;
+                } else {
+                  shrunk = sliceUtf8Bytes(
+                    sliceSafeChars(p.compactHeader, shareChars),
+                    shareBytes
+                  );
+                }
+              }
+            }
+            blocks[p.index] = shrunk;
+            passChars += shrunk.length;
+            passBytes += Buffer.byteLength(shrunk, "utf8");
+          }
+        }
+      }
+      const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+      const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+      const charBlockBudgets = computeWaterFillBudgets(
+        failEntries.map((entry) => entry.pass1Block.length),
+        failPoolChars
+      );
+      const byteBlockBudgets = computeWaterFillBudgets(
+        failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
+        failPoolBytes
+      );
+      for (let j = 0; j < failEntries.length; j++) {
+        const entry = failEntries[j];
+        const blockCharBudget = charBlockBudgets[j] ?? 0;
+        const blockByteBudget = byteBlockBudgets[j] ?? 0;
+        const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
+        const fullHeaderBytes = Buffer.byteLength(entry.header, "utf8");
+        let effectiveHeader = entry.header;
+        if (entry.header.length + Math.min(entry.pass1Body.length, 60) > blockCharBudget || fullHeaderBytes + Math.min(pass1BodyBytes, 60) > blockByteBudget) {
+          const badgeBytes = Buffer.byteLength(entry.badgeLine, "utf8");
+          const remChars = blockCharBudget - entry.badgeLine.length;
+          const remBytes = blockByteBudget - badgeBytes;
+          if (remChars >= 64 && remBytes >= 64) {
+            const cmdCap = Math.max(8, Math.floor(Math.min(remChars, remBytes) * 0.35) - 6);
+            const rawCmdBytes = Buffer.byteLength(entry.spec.command, "utf8");
+            const shortCmd = entry.spec.command.length <= cmdCap && rawCmdBytes <= cmdCap ? entry.spec.command : `${sliceUtf8Bytes(sliceSafeChars(entry.spec.command, cmdCap), cmdCap)}...`;
+            effectiveHeader = `${entry.badgeLine}$ ${shortCmd}
+`;
+          } else {
+            effectiveHeader = entry.badgeLine;
+          }
+        }
+        const headerChars = effectiveHeader.length;
+        const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
+        const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
+        const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
+        if (entry.pass1Body.length <= allowedBodyChars && pass1BodyBytes <= allowedBodyBytes) {
+          blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
+          continue;
+        }
+        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+        let targetChars = Math.min(
+          allowedBodyChars,
+          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar))
+        );
+        let compactedBody = targetChars > 0 ? formatCompactCommandOutput({
+          stdout: entry.result.stdout,
+          stderr: entry.result.stderr,
+          exitCode: entry.result.exitCode,
+          timedOut: entry.result.timedOut,
+          error: entry.result.error,
+          maxChars: targetChars
+        }) : "";
+        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+          const curBytes = Buffer.byteLength(compactedBody, "utf8");
+          if (curBytes <= allowedBodyBytes) break;
+          targetChars = Math.max(
+            1,
+            Math.min(
+              targetChars - 1,
+              Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98)
+            )
+          );
+          compactedBody = formatCompactCommandOutput({
+            stdout: entry.result.stdout,
+            stderr: entry.result.stderr,
+            exitCode: entry.result.exitCode,
+            timedOut: entry.result.timedOut,
+            error: entry.result.error,
+            maxChars: targetChars
+          });
+        }
+        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+      }
+    }
+  }
   const fittedBlocks = fitSectionsToByteBudget(
     blocks,
     bodyBudget,
     bodyByteBudget,
-    "\n\n"
+    separator
   );
   let text = truncateWithNotice(
-    `${summaryHeader}
-
-${fittedBlocks}`,
+    `${summaryHeader}${separator}${fittedBlocks}`,
     maxChars
   );
-  if (maxBytes !== void 0) {
-    text = truncateWithByteNotice(text, maxBytes);
-  }
+  text = truncateWithByteNotice(text, maxBytes);
   return { text, isError: false };
 }
 function clampInt2(val, min, max, fallback) {
