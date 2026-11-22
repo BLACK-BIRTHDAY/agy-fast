@@ -2,8 +2,8 @@
 
 
 // src/mcp-server.ts
-import fs6 from "node:fs";
-import path7 from "node:path";
+import fs7 from "node:fs";
+import path9 from "node:path";
 
 // src/protocol/mcp.ts
 import { fileURLToPath } from "node:url";
@@ -1573,9 +1573,6 @@ ${tail}` : "TIMED OUT (no output)";
     rawChars
   };
 }
-function formatCompactCommandOutput(params) {
-  return formatCompactCommandOutputWithMeta(params).text;
-}
 function getTailLines(text, count) {
   if (!text) return "";
   const lines = text.split("\n");
@@ -1866,8 +1863,8 @@ function readSavedEditsFormatSync(env = process.env) {
 }
 
 // src/tools/apply-edits.ts
-import { promises as fs3 } from "node:fs";
-import path4 from "node:path";
+import { promises as fs4 } from "node:fs";
+import path6 from "node:path";
 
 // src/utils/arg-validation.ts
 function isPlainObject(value) {
@@ -2155,6 +2152,392 @@ async function walkFiles(rootDir, options = {}) {
   }
   await visit(rootDir, "", 0);
   return { files, truncated };
+}
+
+// src/utils/spill.ts
+import crypto from "node:crypto";
+import { promises as fs3, readFileSync } from "node:fs";
+import path5 from "node:path";
+
+// src/utils/updater-core.ts
+import os3 from "node:os";
+import path4 from "node:path";
+var LOCK_STALE_MS = 10 * 60 * 1e3;
+function getHomeDir(env = process.env) {
+  return process.platform === "win32" ? env.USERPROFILE || env.HOME || os3.homedir() : env.HOME || env.USERPROFILE || os3.homedir();
+}
+function getUpdaterPaths(env = process.env) {
+  const custom = env.AGY_FAST_CACHE_DIR?.trim();
+  const cacheDir = custom ? path4.resolve(custom) : path4.join(getHomeDir(env), ".gemini", "cache", "agy-fast");
+  return {
+    cacheDir,
+    stateFile: path4.join(cacheDir, "update-state.json"),
+    configFile: path4.join(cacheDir, "config.json"),
+    lockFile: path4.join(cacheDir, "update.lock")
+  };
+}
+
+// src/utils/spill.ts
+var SPILL_MAX_BYTES = 2 * 1024 * 1024;
+var SPILL_TTL_MS = 24 * 60 * 60 * 1e3;
+var SPILL_MAX_FILES = 50;
+var SPILL_FILENAME_REGEX = /^[a-z0-9_-]+-\d{8}-\d{6}-[0-9a-f]{6}\.log$/i;
+var SPILL_CAP_NOTICE = "\n... [spill file capped at 2 MB]";
+var SPILL_CAP_NOTICE_BYTES = Buffer.byteLength(SPILL_CAP_NOTICE, "utf8");
+var PEM_BEGIN_PREFIX = "-----BEGIN ";
+var PEM_END_PREFIX = "-----END ";
+var PEM_KEY_SUFFIX = "PRIVATE KEY-----";
+var PEM_MAX_LABEL_LEN = 64;
+var PEM_WINDOW_LEN = PEM_MAX_LABEL_LEN + PEM_KEY_SUFFIX.length;
+var PEM_LABEL_REGEX = /^[A-Z0-9 ]{0,64}$/;
+var TRAILING_TOKEN_DELIMS = /* @__PURE__ */ new Set([",", ";", ")", '"', "'", "`", ">", "}", "]"]);
+var AUTH_BEARER_REGEX = /(Authorization[ \t]*:[ \t]*Bearer[ \t]+)(\S+)/gi;
+var BARE_BEARER_REGEX = /(\bBearer[ \t]+)(\S+)/gi;
+var GITHUB_CLASSIC_TOKEN_REGEX = /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g;
+var GITHUB_PAT_TOKEN_REGEX = /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g;
+var SK_API_KEY_REGEX = /\bsk-[A-Za-z0-9_-]{16,}\b/g;
+var GOOGLE_API_KEY_REGEX = /\bAIza[0-9A-Za-z_-]{35}\b/g;
+var AWS_ACCESS_KEY_REGEX = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g;
+var SLACK_TOKEN_REGEX = /\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g;
+function parseSpillToggle(raw) {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return null;
+  const norm = raw.trim().toLowerCase();
+  if (norm === "off" || norm === "0" || norm === "false") return false;
+  if (norm === "on" || norm === "1" || norm === "true") return true;
+  return null;
+}
+function getSpillDir(env = process.env) {
+  return path5.join(getUpdaterPaths(env).cacheDir, "spill");
+}
+function isSpillEnabled(env = process.env) {
+  const envVal = parseSpillToggle(env.AGY_FAST_SPILL);
+  if (envVal !== null) return envVal;
+  try {
+    const { configFile } = getUpdaterPaths(env);
+    const raw = readFileSync(configFile, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const cfgVal = parseSpillToggle(parsed.spill);
+      if (cfgVal !== null) return cfgVal;
+    }
+  } catch {
+  }
+  return true;
+}
+function splitTrailingTokenDelims(token) {
+  let end = token.length;
+  while (end > 0 && TRAILING_TOKEN_DELIMS.has(token[end - 1])) {
+    end--;
+  }
+  return [token.slice(0, end), token.slice(end)];
+}
+function redactPemPrivateKeys(text) {
+  const firstBegin = text.indexOf(PEM_BEGIN_PREFIX);
+  if (firstBegin === -1) return text;
+  const firstEnd = text.indexOf(PEM_END_PREFIX, firstBegin + PEM_BEGIN_PREFIX.length);
+  if (firstEnd === -1) return text;
+  const endMarkersByLabel = /* @__PURE__ */ new Map();
+  let endPos = firstEnd;
+  while (endPos !== -1) {
+    const contentStart = endPos + PEM_END_PREFIX.length;
+    const relSuffix = text.slice(contentStart, contentStart + PEM_WINDOW_LEN).indexOf(PEM_KEY_SUFFIX);
+    if (relSuffix !== -1) {
+      const label = text.slice(contentStart, contentStart + relSuffix);
+      if (PEM_LABEL_REGEX.test(label)) {
+        let bucket = endMarkersByLabel.get(label);
+        if (!bucket) {
+          bucket = { offsets: [], ptr: 0 };
+          endMarkersByLabel.set(label, bucket);
+        }
+        bucket.offsets.push(endPos);
+        endPos = text.indexOf(
+          PEM_END_PREFIX,
+          contentStart + relSuffix + PEM_KEY_SUFFIX.length
+        );
+        continue;
+      }
+    }
+    endPos = text.indexOf(PEM_END_PREFIX, contentStart);
+  }
+  if (endMarkersByLabel.size === 0) return text;
+  const chunks = [];
+  let cursor = 0;
+  let beginPos = firstBegin;
+  while (beginPos !== -1) {
+    const contentStart = beginPos + PEM_BEGIN_PREFIX.length;
+    const relSuffix = text.slice(contentStart, contentStart + PEM_WINDOW_LEN).indexOf(PEM_KEY_SUFFIX);
+    if (relSuffix !== -1) {
+      const label = text.slice(contentStart, contentStart + relSuffix);
+      if (PEM_LABEL_REGEX.test(label)) {
+        const headerEnd = contentStart + relSuffix + PEM_KEY_SUFFIX.length;
+        const bucket = endMarkersByLabel.get(label);
+        if (bucket) {
+          while (bucket.ptr < bucket.offsets.length && bucket.offsets[bucket.ptr] < headerEnd) {
+            bucket.ptr++;
+          }
+          if (bucket.ptr < bucket.offsets.length) {
+            const matchedEnd = bucket.offsets[bucket.ptr];
+            bucket.ptr++;
+            const blockEnd = matchedEnd + PEM_END_PREFIX.length + label.length + PEM_KEY_SUFFIX.length;
+            chunks.push(text.slice(cursor, beginPos), "[REDACTED PRIVATE KEY]");
+            cursor = blockEnd;
+            beginPos = text.indexOf(PEM_BEGIN_PREFIX, cursor);
+            continue;
+          }
+        }
+      }
+    }
+    beginPos = text.indexOf(PEM_BEGIN_PREFIX, contentStart);
+  }
+  if (chunks.length === 0) return text;
+  chunks.push(text.slice(cursor));
+  return chunks.join("");
+}
+function redactSecrets(text) {
+  if (!text) return text;
+  let out = redactPemPrivateKeys(text);
+  out = out.replace(AUTH_BEARER_REGEX, (full, prefix, token) => {
+    if (token.startsWith("[REDACTED]")) return full;
+    const [core, trail] = splitTrailingTokenDelims(token);
+    if (!core) return full;
+    return `${prefix}[REDACTED]${trail}`;
+  });
+  out = out.replace(BARE_BEARER_REGEX, (full, prefix, token) => {
+    if (token.startsWith("[REDACTED]")) return full;
+    const [core, trail] = splitTrailingTokenDelims(token);
+    if (core.length < 16) return full;
+    return `${prefix}[REDACTED]${trail}`;
+  });
+  out = out.replace(GITHUB_CLASSIC_TOKEN_REGEX, "[REDACTED]");
+  out = out.replace(GITHUB_PAT_TOKEN_REGEX, "[REDACTED]");
+  out = out.replace(SK_API_KEY_REGEX, "[REDACTED]");
+  out = out.replace(GOOGLE_API_KEY_REGEX, "[REDACTED]");
+  out = out.replace(AWS_ACCESS_KEY_REGEX, "[REDACTED]");
+  out = out.replace(SLACK_TOKEN_REGEX, "[REDACTED]");
+  return out;
+}
+function sanitizeToolName(tool) {
+  const cleaned = tool.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return (cleaned || "tool").slice(0, 32);
+}
+function sanitizeSectionLabel(label) {
+  const cleaned = label.replace(/[\r\n]+/g, " ").trim();
+  return cleaned || "section";
+}
+function formatUtcTimestamp(nowMs) {
+  const d = new Date(nowMs);
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const yyyy = String(d.getUTCFullYear()).padStart(4, "0");
+  const mm = pad2(d.getUTCMonth() + 1);
+  const dd = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mi = pad2(d.getUTCMinutes());
+  const ss = pad2(d.getUTCSeconds());
+  return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
+}
+async function ensureSafeSpillDir(spillDir) {
+  const cacheDir = path5.dirname(spillDir);
+  try {
+    const parentSt = await fs3.lstat(cacheDir);
+    if (parentSt.isSymbolicLink() || !parentSt.isDirectory()) {
+      return false;
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      return false;
+    }
+    await fs3.mkdir(cacheDir, { recursive: true, mode: 448 });
+    const postParentSt = await fs3.lstat(cacheDir);
+    if (postParentSt.isSymbolicLink() || !postParentSt.isDirectory()) {
+      return false;
+    }
+  }
+  try {
+    const st = await fs3.lstat(spillDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      return false;
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      return false;
+    }
+    await fs3.mkdir(spillDir, { recursive: true, mode: 448 });
+    const postSt = await fs3.lstat(spillDir);
+    if (postSt.isSymbolicLink() || !postSt.isDirectory()) {
+      return false;
+    }
+  }
+  await fs3.chmod(spillDir, 448).catch(() => {
+  });
+  return true;
+}
+async function cleanupSpillDir(spillDir, keepFileName, nowMs) {
+  try {
+    const names = await fs3.readdir(spillDir);
+    const survivors = [];
+    for (const name of names) {
+      if (!SPILL_FILENAME_REGEX.test(name)) continue;
+      if (name === keepFileName) continue;
+      const fullPath = path5.join(spillDir, name);
+      let st;
+      try {
+        st = await fs3.lstat(fullPath);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink() || !st.isFile()) continue;
+      if (nowMs - st.mtimeMs > SPILL_TTL_MS) {
+        await fs3.unlink(fullPath).catch(() => {
+        });
+      } else {
+        survivors.push({ name, fullPath, mtimeMs: st.mtimeMs });
+      }
+    }
+    const maxOtherFiles = Math.max(0, SPILL_MAX_FILES - 1);
+    if (survivors.length > maxOtherFiles) {
+      survivors.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name));
+      const removeCount = survivors.length - maxOtherFiles;
+      for (let i = 0; i < removeCount; i++) {
+        await fs3.unlink(survivors[i].fullPath).catch(() => {
+        });
+      }
+    }
+  } catch {
+  }
+}
+async function writeSpillFile(options) {
+  const env = options.env ?? process.env;
+  if (!isSpillEnabled(env) || options.sections.length === 0) {
+    return null;
+  }
+  try {
+    const nowMs = typeof options.nowMs === "number" && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+    const spillDir = getSpillDir(env);
+    const dirOk = await ensureSafeSpillDir(spillDir);
+    if (!dirOk) return null;
+    const blocks = [];
+    const ranges = [];
+    let currentLine = 1;
+    for (const sec of options.sections) {
+      const label = sanitizeSectionLabel(sec.label);
+      const redacted = redactSecrets(sec.content).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const body = redacted.endsWith("\n") ? redacted.slice(0, -1) : redacted;
+      const block = `=== ${label} ===
+${body}`;
+      const blockLines = block.split("\n").length;
+      const startLine = currentLine;
+      const endLine = currentLine + blockLines - 1;
+      blocks.push(block);
+      ranges.push({
+        label,
+        startLine,
+        endLine,
+        truncated: Boolean(sec.truncated)
+      });
+      currentLine = endLine + 2;
+    }
+    let finalContent = blocks.join("\n\n");
+    let capped = false;
+    let totalBytes = Buffer.byteLength(finalContent, "utf8");
+    if (totalBytes > SPILL_MAX_BYTES) {
+      const maxPrefixBytes = Math.max(0, SPILL_MAX_BYTES - SPILL_CAP_NOTICE_BYTES);
+      const prefix = sliceUtf8Bytes(finalContent, maxPrefixBytes);
+      const cutChar = finalContent.charAt(prefix.length);
+      const prefixLines = prefix.split("\n").length;
+      finalContent = `${prefix}${SPILL_CAP_NOTICE}`;
+      totalBytes = Buffer.byteLength(finalContent, "utf8");
+      capped = true;
+      const finalTotalLines = finalContent.split("\n").length;
+      for (const r of ranges) {
+        if (r.endLine > prefixLines || r.endLine === prefixLines && cutChar !== "" && cutChar !== "\n") {
+          r.truncated = true;
+        }
+        r.startLine = Math.min(r.startLine, finalTotalLines);
+        r.endLine = Math.min(r.endLine, finalTotalLines);
+      }
+    }
+    const totalLines = finalContent.split("\n").length;
+    const safeTool = sanitizeToolName(options.tool);
+    const ts = formatUtcTimestamp(nowMs);
+    let fileName = "";
+    let filePath = "";
+    let written = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const hex = crypto.randomBytes(3).toString("hex");
+      fileName = `${safeTool}-${ts}-${hex}.log`;
+      filePath = path5.join(spillDir, fileName);
+      try {
+        await fs3.writeFile(filePath, finalContent, {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 384
+        });
+        written = true;
+        break;
+      } catch (err) {
+        if (err?.code === "EEXIST") {
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (!written) return null;
+    await fs3.chmod(filePath, 384).catch(() => {
+    });
+    await cleanupSpillDir(spillDir, fileName, nowMs);
+    return {
+      filePath,
+      totalLines,
+      totalBytes,
+      capped,
+      sections: ranges
+    };
+  } catch {
+    return null;
+  }
+}
+function formatShortLabel(label, maxLen = 28) {
+  const clean = label.replace(/\s+/g, " ").trim() || "section";
+  if (clean.length <= maxLen) return clean;
+  return `${sliceSafeChars(clean, Math.max(1, maxLen - 3))}...`;
+}
+function fitsFooterCaps(footer, maxChars, maxBytes) {
+  if (maxChars !== void 0 && footer.length > maxChars) return false;
+  if (maxBytes !== void 0 && Buffer.byteLength(footer, "utf8") > maxBytes) return false;
+  return true;
+}
+function formatSpillFooter(result, opts = {}) {
+  const maxRanges = Math.max(1, Math.trunc(opts.maxRanges ?? 4));
+  const explicitCap = opts.maxChars !== void 0 || opts.maxBytes !== void 0;
+  const effectiveMaxChars = opts.maxChars ?? 480;
+  const effectiveMaxBytes = opts.maxBytes;
+  const truncated = result.sections.filter((s) => s.truncated);
+  const candidates = truncated.length > 0 ? truncated : result.sections;
+  const baseHead = `
+[full output spilled: ${result.filePath} (${result.totalLines} lines)`;
+  const minimalFooter = `${baseHead}]`;
+  if (candidates.length > 0) {
+    const startCount = Math.min(maxRanges, candidates.length);
+    for (let count = startCount; count >= 1; count--) {
+      const shown = candidates.slice(0, count);
+      const extra = candidates.length - count;
+      const parts = shown.map(
+        (s) => `${formatShortLabel(s.label)} L${s.startLine}-L${s.endLine}`
+      );
+      if (extra > 0) {
+        parts.push(`+${extra} more`);
+      }
+      const candidate = `${baseHead} \u2014 read_file ranges: ${parts.join(", ")}]`;
+      if (fitsFooterCaps(candidate, effectiveMaxChars, effectiveMaxBytes)) {
+        return candidate;
+      }
+    }
+  }
+  if (!explicitCap || fitsFooterCaps(minimalFooter, opts.maxChars, opts.maxBytes)) {
+    return minimalFooter;
+  }
+  return "";
 }
 
 // src/tools/apply-edits.ts
@@ -2456,40 +2839,40 @@ async function commitPlannedWrites(plans) {
   try {
     for (const plan of plans) {
       const target = plan.writeTargetPath;
-      const dir = path4.dirname(target);
-      await fs3.mkdir(dir, { recursive: true });
+      const dir = path6.dirname(target);
+      await fs4.mkdir(dir, { recursive: true });
       const tmpPath = `${target}.agy-fast-tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       try {
-        await fs3.writeFile(tmpPath, plan.newContent, "utf8");
+        await fs4.writeFile(tmpPath, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
-          await fs3.chmod(tmpPath, plan.originalMode);
+          await fs4.chmod(tmpPath, plan.originalMode);
         }
       } catch (tmpErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs4.unlink(tmpPath);
         } catch {
         }
         throw tmpErr;
       }
       try {
-        await fs3.rename(tmpPath, target);
+        await fs4.rename(tmpPath, target);
         written.push(plan);
       } catch (renameErr) {
         try {
-          await fs3.unlink(tmpPath);
+          await fs4.unlink(tmpPath);
         } catch {
         }
         written.push(plan);
         if (plan.originalSymlinkTarget) {
           try {
-            await fs3.unlink(target);
+            await fs4.unlink(target);
           } catch {
           }
         }
-        await fs3.writeFile(target, plan.newContent, "utf8");
+        await fs4.writeFile(target, plan.newContent, "utf8");
         if (plan.originalMode !== null && process.platform !== "win32") {
           try {
-            await fs3.chmod(target, plan.originalMode);
+            await fs4.chmod(target, plan.originalMode);
           } catch {
           }
         }
@@ -2502,16 +2885,16 @@ async function commitPlannedWrites(plans) {
       const target = item.writeTargetPath;
       try {
         if (item.originalSymlinkTarget) {
-          await fs3.unlink(target).catch(() => {
+          await fs4.unlink(target).catch(() => {
           });
-          await fs3.symlink(item.originalSymlinkTarget, target);
+          await fs4.symlink(item.originalSymlinkTarget, target);
         } else if (item.existed && item.originalBuffer !== null) {
-          await fs3.writeFile(target, item.originalBuffer);
+          await fs4.writeFile(target, item.originalBuffer);
           if (item.originalMode !== null && process.platform !== "win32") {
-            await fs3.chmod(target, item.originalMode);
+            await fs4.chmod(target, item.originalMode);
           }
         } else if (!item.existed) {
-          await fs3.unlink(target);
+          await fs4.unlink(target);
         }
       } catch {
       }
@@ -2654,15 +3037,15 @@ async function runApplyEdits(input) {
     const absPath = resolvePath(entry.path, baseCwd);
     let writeTargetPath = absPath;
     try {
-      writeTargetPath = await fs3.realpath(absPath);
+      writeTargetPath = await fs4.realpath(absPath);
     } catch {
       try {
-        const realParent = await fs3.realpath(path4.dirname(absPath));
-        writeTargetPath = path4.join(realParent, path4.basename(absPath));
+        const realParent = await fs4.realpath(path6.dirname(absPath));
+        writeTargetPath = path6.join(realParent, path6.basename(absPath));
       } catch {
       }
     }
-    const relPath = toPosixPath(path4.relative(baseCwd, absPath)) || path4.basename(absPath);
+    const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
     const hasCreate = typeof entry.create === "string";
     const hasHunks = Array.isArray(entry.hunks) && entry.hunks.length > 0;
     if (!hasCreate && !hasHunks) {
@@ -2706,10 +3089,10 @@ async function runApplyEdits(input) {
       let originalMode = null;
       let originalSymlinkTarget = null;
       try {
-        const lst = await fs3.lstat(item.writeTargetPath);
+        const lst = await fs4.lstat(item.writeTargetPath);
         if (lst.isSymbolicLink()) {
           try {
-            const st = await fs3.stat(item.writeTargetPath);
+            const st = await fs4.stat(item.writeTargetPath);
             if (st.isDirectory()) {
               errors.push(`${item.relPath}: target path is a directory`);
               continue;
@@ -2722,7 +3105,7 @@ async function runApplyEdits(input) {
               continue;
             }
             originalMode = st.mode & 4095;
-            originalBuffer = await fs3.readFile(item.writeTargetPath);
+            originalBuffer = await fs4.readFile(item.writeTargetPath);
           } catch (statErr) {
             if (statErr?.code === "ENOENT") {
               exists = true;
@@ -2732,7 +3115,7 @@ async function runApplyEdits(input) {
                 );
                 continue;
               }
-              originalSymlinkTarget = await fs3.readlink(item.writeTargetPath);
+              originalSymlinkTarget = await fs4.readlink(item.writeTargetPath);
             } else {
               errors.push(
                 `${item.relPath}: ${statErr instanceof Error ? statErr.message : String(statErr)}`
@@ -2741,7 +3124,7 @@ async function runApplyEdits(input) {
             }
           }
         } else {
-          const st = await fs3.stat(item.writeTargetPath);
+          const st = await fs4.stat(item.writeTargetPath);
           if (st.isDirectory()) {
             errors.push(`${item.relPath}: target path is a directory`);
             continue;
@@ -2754,7 +3137,7 @@ async function runApplyEdits(input) {
             continue;
           }
           originalMode = st.mode & 4095;
-          originalBuffer = await fs3.readFile(item.writeTargetPath);
+          originalBuffer = await fs4.readFile(item.writeTargetPath);
         }
       } catch (err) {
         if (err?.code === "ENOENT") {
@@ -2882,7 +3265,7 @@ ${summaryLines.join("\n")}`];
       timeoutMs
     });
     const status = res.timedOut ? "TIMEOUT" : res.exitCode === 0 ? "PASS" : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+    const verifyMeta = formatCompactCommandOutputWithMeta({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
@@ -2890,11 +3273,98 @@ ${summaryLines.join("\n")}`];
       error: res.error,
       maxChars: maxVerifyChars
     });
-    parts.push(
-      `
+    const verifyPrefix = `
 Verify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:
-${formatted}`
-    );
+`;
+    const baseText = `${parts[0]}
+${verifyPrefix}`;
+    const candidateOutText = `${baseText}${verifyMeta.text}`;
+    const candidateBytes = Buffer.byteLength(candidateOutText, "utf8");
+    const verifyFailed = Boolean(res.error || res.timedOut || res.exitCode !== 0);
+    const shouldSpill = verifyFailed && (verifyMeta.truncated || verifyMeta.collapsedLines >= 20 || verifyMeta.rawChars > maxVerifyChars) || candidateBytes > DEFAULT_INLINE_MAX_BYTES;
+    if (shouldSpill) {
+      const footerCapChars = Math.min(480, Math.max(0, maxVerifyChars - 120));
+      const footerCapBytes = Math.min(900, Math.max(0, DEFAULT_INLINE_MAX_BYTES - 240));
+      if (footerCapChars >= 48 && footerCapBytes >= 48) {
+        const rawNormalized = [
+          normalizeTerminalOutput(res.stdout),
+          normalizeTerminalOutput(res.stderr)
+        ].filter(Boolean).join("\n");
+        const spillContent = res.error ? `spawn error: ${res.error}` : rawNormalized || "(no output)";
+        const spillResult = await writeSpillFile({
+          tool: "apply_edits",
+          sections: [
+            {
+              label: "verify",
+              content: spillContent,
+              truncated: true
+            }
+          ]
+        });
+        if (spillResult) {
+          const footer = formatSpillFooter(spillResult, {
+            maxChars: footerCapChars,
+            maxBytes: footerCapBytes
+          });
+          if (!footer) {
+            await fs4.unlink(spillResult.filePath).catch(() => {
+            });
+          } else {
+            const footerBytes = Buffer.byteLength(footer, "utf8");
+            const maxPrefixBytes = Math.max(0, DEFAULT_INLINE_MAX_BYTES - footerBytes);
+            const baseBytes = Buffer.byteLength(baseText, "utf8");
+            const availVerifyBytes = Math.max(0, maxPrefixBytes - baseBytes);
+            const reducedVerifyChars = Math.max(120, maxVerifyChars - footer.length);
+            let verifyBody = verifyMeta.text;
+            const curBodyBytes = Buffer.byteLength(verifyBody, "utf8");
+            if (verifyBody.length > reducedVerifyChars || curBodyBytes > availVerifyBytes) {
+              if (availVerifyBytes <= 0) {
+                verifyBody = "";
+              } else {
+                const bytesPerChar = curBodyBytes / Math.max(1, verifyBody.length);
+                let targetChars = Math.min(
+                  reducedVerifyChars,
+                  Math.max(1, Math.floor(availVerifyBytes / Math.max(1, bytesPerChar)))
+                );
+                verifyBody = formatCompactCommandOutputWithMeta({
+                  stdout: res.stdout,
+                  stderr: res.stderr,
+                  exitCode: res.exitCode,
+                  timedOut: res.timedOut,
+                  error: res.error,
+                  maxChars: targetChars
+                }).text;
+                for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+                  const bodyBytes = Buffer.byteLength(verifyBody, "utf8");
+                  if (bodyBytes <= availVerifyBytes) break;
+                  targetChars = Math.max(
+                    1,
+                    Math.min(
+                      targetChars - 1,
+                      Math.floor(targetChars * (availVerifyBytes / bodyBytes) * 0.98)
+                    )
+                  );
+                  verifyBody = formatCompactCommandOutputWithMeta({
+                    stdout: res.stdout,
+                    stderr: res.stderr,
+                    exitCode: res.exitCode,
+                    timedOut: res.timedOut,
+                    error: res.error,
+                    maxChars: targetChars
+                  }).text;
+                }
+              }
+            }
+            const prefix = truncateWithByteNotice(
+              `${baseText}${verifyBody}`,
+              maxPrefixBytes
+            );
+            return { text: `${prefix}${footer}`, isError: false };
+          }
+        }
+      }
+    }
+    parts.push(`${verifyPrefix}${verifyMeta.text}`);
   }
   const outText = parts.join("\n");
   const finalText = truncateWithByteNotice(outText, DEFAULT_INLINE_MAX_BYTES);
@@ -2902,8 +3372,8 @@ ${formatted}`
 }
 
 // src/tools/batch-search.ts
-import { promises as fs4 } from "node:fs";
-import path5 from "node:path";
+import { promises as fs5 } from "node:fs";
+import path7 from "node:path";
 
 // src/utils/fuzzy-match.ts
 function findContiguousIndex(haystack, needle) {
@@ -3387,7 +3857,7 @@ function resolveFileTypeGlobs(fileType) {
 }
 function fileTypeMatcher(fileType) {
   const matchers = (resolveFileTypeGlobs(fileType) ?? []).map(globToRegExp);
-  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path5.basename(file)));
+  return (file) => matchers.length === 0 || matchers.some((matcher) => matcher.test(path7.basename(file)));
 }
 async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const maxResults = clampInt(query.maxResults ?? 40, 1, 200);
@@ -3395,7 +3865,7 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
   const summary = query.outputMode === "count" || query.outputMode === "files_with_matches";
   const typeGlobs = resolveFileTypeGlobs(query.fileType);
   const matchesType = fileTypeMatcher(query.fileType);
-  const fileStat = await fs4.stat(searchRoot);
+  const fileStat = await fs5.stat(searchRoot);
   const isFileTarget = fileStat.isFile();
   if (isFileTarget) {
     if (typeGlobs && !matchesType(searchRoot)) {
@@ -3409,12 +3879,12 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
       const rawGlob = negated ? query.glob.slice(1) : query.glob;
       const globRe = globToRegExp(rawGlob);
       const relPosix = relativeFile(baseCwd, searchRoot);
-      const matched = globRe.test(relPosix) || globRe.test(path5.basename(searchRoot));
+      const matched = globRe.test(relPosix) || globRe.test(path7.basename(searchRoot));
       if (negated ? matched : !matched) {
         return { files: [], totalMatches: 0, truncated: false };
       }
     }
-    const fh = await fs4.open(searchRoot, "r");
+    const fh = await fs5.open(searchRoot, "r");
     try {
       const head = Buffer.alloc(Math.min(fileStat.size, 8192));
       const { bytesRead } = await fh.read(head, 0, head.length, 0);
@@ -3552,9 +4022,9 @@ async function runTextOrRegexWithRg(query, searchRoot, baseCwd) {
     }
   }
   const toRgArgPath = (rawFile) => {
-    const rel = path5.relative(baseCwd, rawFile);
-    const chosenPath = rel && !rel.startsWith("..") && !path5.isAbsolute(rel) ? rel : rawFile;
-    return chosenPath === "-" ? `.${path5.sep}-` : chosenPath;
+    const rel = path7.relative(baseCwd, rawFile);
+    const chosenPath = rel && !rel.startsWith("..") && !path7.isAbsolute(rel) ? rel : rawFile;
+    return chosenPath === "-" ? `.${path7.sep}-` : chosenPath;
   };
   const rgChunks = [];
   let currentChunk = [];
@@ -3728,11 +4198,11 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     }
     return globNegated ? !matched : matched;
   };
-  const stat = await fs4.stat(searchRoot);
+  const stat = await fs5.stat(searchRoot);
   const perFileCap = stat.isFile() ? maxResults : Math.min(maxResults, 50);
   let targetFiles;
   if (stat.isFile()) {
-    const relPosix = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
+    const relPosix = toPosixPath(path7.relative(baseCwd, searchRoot)) || path7.basename(searchRoot);
     targetFiles = globMatchesFile(relPosix) ? [searchRoot] : [];
   } else {
     const includeHidden = Boolean(
@@ -3744,7 +4214,7 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
       fileFilter: globMatchesFile
     });
     discoveryTruncated = walked.truncated;
-    targetFiles = walked.files.map((rel) => path5.join(searchRoot, rel));
+    targetFiles = walked.files.map((rel) => path7.join(searchRoot, rel));
     targetFiles.sort((a, b) => {
       const ra = relativeFile(baseCwd, a);
       const rb = relativeFile(baseCwd, b);
@@ -3781,9 +4251,9 @@ async function runTextOrRegexWithNode(query, searchRoot, baseCwd) {
     const results = await Promise.all(
       batch.map(async (absFile) => {
         try {
-          const st = await fs4.stat(absFile);
+          const st = await fs5.stat(absFile);
           if (st.size > 2 * 1024 * 1024) return null;
-          const buf = await fs4.readFile(absFile);
+          const buf = await fs5.readFile(absFile);
           if (isLikelyBinary(buf)) return null;
           const content = buf.toString("utf8");
           const lines = content.split(/\r?\n/);
@@ -3889,13 +4359,13 @@ function buildGlobFallbackPlan(pattern) {
   return null;
 }
 async function formatGlobWalkResult(walked, searchRoot, baseCwd, maxResults, sortBy, notePrefix) {
-  const relPrefix = toPosixPath(path5.relative(baseCwd, searchRoot));
+  const relPrefix = toPosixPath(path7.relative(baseCwd, searchRoot));
   const sortedFiles = [...walked.files].sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   if (sortBy === "mtime") {
     const mtimes = /* @__PURE__ */ new Map();
     for (let i = 0; i < sortedFiles.length; i += 32) {
       await Promise.all(sortedFiles.slice(i, i + 32).map(async (file) => {
-        const stat = await fs4.lstat(path5.join(searchRoot, file)).catch(() => void 0);
+        const stat = await fs5.lstat(path7.join(searchRoot, file)).catch(() => void 0);
         mtimes.set(file, stat?.mtimeMs ?? -Infinity);
       }));
     }
@@ -3932,8 +4402,8 @@ async function runGlobQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchBasename = !pattern.includes("/");
   const includeHidden = pattern.startsWith(".") || pattern.includes("/.");
   if (isFileTarget) {
-    const rel = toPosixPath(path5.relative(baseCwd, searchRoot)) || path5.basename(searchRoot);
-    const base = path5.basename(searchRoot);
+    const rel = toPosixPath(path7.relative(baseCwd, searchRoot)) || path7.basename(searchRoot);
+    const base = path7.basename(searchRoot);
     const matched = matcher.test(rel) || matchBasename && matcher.test(base);
     if (matched) return rel;
     const fallback2 = buildGlobFallbackPlan(pattern);
@@ -3984,7 +4454,7 @@ ${rel}` : fallback2.emptyMessage;
   return "(no files matched)";
 }
 function relativeFile(baseCwd, file) {
-  return toPosixPath(path5.relative(baseCwd, path5.resolve(baseCwd, file))) || path5.basename(file);
+  return toPosixPath(path7.relative(baseCwd, path7.resolve(baseCwd, file))) || path7.basename(file);
 }
 async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const pattern = query.pattern.trim();
@@ -3992,7 +4462,7 @@ async function runFuzzyQuery(query, searchRoot, baseCwd, isFileTarget) {
   const matchesType = fileTypeMatcher(query.fileType);
   const maxResults = clampInt(query.maxResults ?? 30, 1, 200);
   const walked = isFileTarget ? { files: [searchRoot], truncated: false } : await walkFiles(searchRoot, { maxFiles: 8e3, fileFilter: matchesType });
-  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path5.resolve(searchRoot, file)));
+  const candidates = walked.files.filter(matchesType).map((file) => relativeFile(baseCwd, path7.resolve(searchRoot, file)));
   const { matches, totalMatched } = rankFuzzyPaths(pattern, candidates, maxResults);
   const body = matches.map((match) => match.path).join("\n") || "(no files matched)";
   const footer = walked.truncated || totalMatched > maxResults ? `
@@ -4138,12 +4608,12 @@ async function executeSingleQuery(query, index, baseCwd, useRg) {
     const searchRoot = query.path ? resolvePath(query.path, baseCwd) : baseCwd;
     let targetStat;
     try {
-      targetStat = await fs4.stat(searchRoot);
+      targetStat = await fs5.stat(searchRoot);
     } catch {
       throw new Error(`Path does not exist: ${query.path || baseCwd}`);
     }
     if (query.type === "git") {
-      const gitCwd = targetStat.isFile() ? path5.dirname(searchRoot) : searchRoot;
+      const gitCwd = targetStat.isFile() ? path7.dirname(searchRoot) : searchRoot;
       const out = await runGitQuery(query, gitCwd);
       return `${header}
 ${out}`;
@@ -4251,7 +4721,7 @@ async function runBatchSearch(input, options = {}) {
   const queries = rawQueries;
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs4.stat(baseCwd);
+    const st = await fs5.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -4267,8 +4737,87 @@ async function runBatchSearch(input, options = {}) {
   const sections = await Promise.all(
     queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg))
   );
+  const separator = "\n\n";
+  const rawJoined = sections.join(separator);
+  const rawJoinedBytes = Buffer.byteLength(rawJoined, "utf8");
+  if (rawJoined.length <= maxChars && rawJoinedBytes <= maxBytes) {
+    return { text: rawJoined, isError: false };
+  }
+  const minBodyChars = Math.max(200, sections.length * 55);
+  const minBodyBytes = minBodyChars;
+  const footerCapChars = Math.min(480, maxChars - minBodyChars);
+  const footerCapBytes = Math.min(900, maxBytes - minBodyBytes);
+  if (footerCapChars >= 48 && footerCapBytes >= 48) {
+    const sepChars = separator.length * Math.max(0, sections.length - 1);
+    const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, sections.length - 1);
+    const truncatedMask = new Array(sections.length).fill(false);
+    if (rawJoined.length > maxChars) {
+      if (sepChars >= maxChars) {
+        truncatedMask.fill(true);
+      } else {
+        const charBudgets = computeWaterFillBudgets(
+          sections.map((s) => s.length),
+          maxChars - sepChars
+        );
+        for (let i = 0; i < sections.length; i++) {
+          if (sections[i].length > (charBudgets[i] ?? 0)) {
+            truncatedMask[i] = true;
+          }
+        }
+      }
+    }
+    const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+    if (Buffer.byteLength(charFitted, "utf8") > maxBytes) {
+      if (sepBytes >= maxBytes) {
+        truncatedMask.fill(true);
+      } else {
+        const byteBudgets = computeWaterFillBudgets(
+          sections.map((s) => Buffer.byteLength(s, "utf8")),
+          maxBytes - sepBytes
+        );
+        for (let i = 0; i < sections.length; i++) {
+          if (Buffer.byteLength(sections[i], "utf8") > (byteBudgets[i] ?? 0)) {
+            truncatedMask[i] = true;
+          }
+        }
+      }
+    }
+    const spillSections = sections.map((sec, idx) => ({
+      label: `Query ${idx + 1}`,
+      content: sec,
+      truncated: truncatedMask[idx] ?? false
+    }));
+    const spillResult = await writeSpillFile({
+      tool: "batch_search",
+      sections: spillSections
+    });
+    if (spillResult) {
+      const footer = formatSpillFooter(spillResult, {
+        maxChars: footerCapChars,
+        maxBytes: footerCapBytes
+      });
+      if (!footer) {
+        await fs5.unlink(spillResult.filePath).catch(() => {
+        });
+      } else {
+        const footerBytes = Buffer.byteLength(footer, "utf8");
+        const bodyMaxChars = Math.max(0, maxChars - footer.length);
+        const bodyMaxBytes = Math.max(0, maxBytes - footerBytes);
+        const fittedBody = fitSectionsToByteBudget(
+          sections,
+          bodyMaxChars,
+          bodyMaxBytes,
+          separator
+        );
+        return {
+          text: `${fittedBody}${footer}`,
+          isError: false
+        };
+      }
+    }
+  }
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, separator),
     isError: false
   };
 }
@@ -4278,7 +4827,7 @@ function clampInt(val, min, max) {
 }
 
 // src/tools/read-slices.ts
-import path6 from "node:path";
+import path8 from "node:path";
 function isRegexStartContext(line, slashIdx) {
   let j = slashIdx - 1;
   while (j >= 0 && /\s/.test(line[j])) j--;
@@ -6066,7 +6615,7 @@ function extractSfcSymbols(lines) {
   return symbols.length > 0 ? symbols : extractTsJsSymbols(lines);
 }
 function extractSymbolsFromLines(filePath, lines) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path8.extname(filePath).toLowerCase();
   switch (ext) {
     case ".ts":
     case ".tsx":
@@ -6378,7 +6927,7 @@ async function runReadSlices(input) {
     const outlineResults = await Promise.all(
       outlines.map(async (rawPath) => {
         const absPath = resolvePath(rawPath, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path8.relative(baseCwd, absPath)) || path8.basename(absPath);
         try {
           const { lines } = await loadLines(absPath);
           const symbols = extractSymbolsFromLines(absPath, lines);
@@ -6419,7 +6968,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
           };
         }
         const absPath = resolvePath(req.path, baseCwd);
-        const relPath = toPosixPath(path6.relative(baseCwd, absPath)) || path6.basename(absPath);
+        const relPath = toPosixPath(path8.relative(baseCwd, absPath)) || path8.basename(absPath);
         if (!Array.isArray(req.ranges) || req.ranges.length === 0) {
           return {
             kind: "static",
@@ -6530,7 +7079,7 @@ ERROR: ${err instanceof Error ? err.message : String(err)}`
 }
 
 // src/tools/run-checks.ts
-import { promises as fs5 } from "node:fs";
+import { promises as fs6 } from "node:fs";
 import { performance } from "node:perf_hooks";
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
@@ -6608,7 +7157,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
   }
   const baseCwd = resolvePath(input.cwd || process.cwd());
   try {
-    const st = await fs5.stat(baseCwd);
+    const st = await fs6.stat(baseCwd);
     if (!st.isDirectory()) {
       return { text: `Error: cwd is not a directory: ${baseCwd}`, isError: true };
     }
@@ -6640,7 +7189,7 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     const cmdCwd = trimmedSpecCwd ? resolvePath(trimmedSpecCwd, baseCwd) : baseCwd;
     if (trimmedSpecCwd) {
       try {
-        const st = await fs5.stat(cmdCwd);
+        const st = await fs6.stat(cmdCwd);
         if (!st.isDirectory()) {
           return {
             text: `Error: commands[${i}].cwd is not a directory: ${cmdCwd}`,
@@ -6703,17 +7252,129 @@ async function runChecks(input, budgetMs = MCP_CALL_BUDGET_SEC * 1e3) {
     0,
     maxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8")
   );
+  const firstPass = renderRunChecksBody(
+    outcomes,
+    outputMode,
+    bodyBudget,
+    bodyByteBudget,
+    separator
+  );
+  if (firstPass.spillTriggered) {
+    const minBodyChars = Math.max(200, outcomes.length * 52);
+    const minBodyBytes = minBodyChars;
+    const footerCapChars = Math.min(480, bodyBudget - minBodyChars);
+    const footerCapBytes = Math.min(900, bodyByteBudget - minBodyBytes);
+    if (footerCapChars >= 48 && footerCapBytes >= 48) {
+      const spillSections = [];
+      for (let i = 0; i < outcomes.length; i++) {
+        const outcome = outcomes[i];
+        if (!outcome.result) continue;
+        spillSections.push({
+          label: outcome.spec.name,
+          content: buildNormalizedCommandOutput(outcome.result),
+          truncated: firstPass.truncatedOutcomeIndices.has(i)
+        });
+      }
+      if (spillSections.length > 0) {
+        const spillResult = await writeSpillFile({
+          tool: "run_checks",
+          sections: spillSections
+        });
+        if (spillResult) {
+          const footer = formatSpillFooter(spillResult, {
+            maxChars: footerCapChars,
+            maxBytes: footerCapBytes
+          });
+          if (!footer) {
+            await fs6.unlink(spillResult.filePath).catch(() => {
+            });
+          } else {
+            const footerBytes = Buffer.byteLength(footer, "utf8");
+            const reducedBodyBudget = Math.max(0, bodyBudget - footer.length);
+            const reducedBodyByteBudget = Math.max(0, bodyByteBudget - footerBytes);
+            const secondPass = renderRunChecksBody(
+              outcomes,
+              outputMode,
+              reducedBodyBudget,
+              reducedBodyByteBudget,
+              separator
+            );
+            const maxPrefixChars = Math.max(0, maxChars - footer.length);
+            const maxPrefixBytes = Math.max(0, maxBytes - footerBytes);
+            let prefix = truncateWithNotice(
+              `${summaryHeader}${separator}${secondPass.fittedBody}`,
+              maxPrefixChars
+            );
+            prefix = truncateWithByteNotice(prefix, maxPrefixBytes);
+            return { text: `${prefix}${footer}`, isError: false };
+          }
+        }
+      }
+    }
+  }
+  let text = truncateWithNotice(
+    `${summaryHeader}${separator}${firstPass.fittedBody}`,
+    maxChars
+  );
+  text = truncateWithByteNotice(text, maxBytes);
+  return { text, isError: false };
+}
+function buildNormalizedCommandOutput(result) {
+  const combined = [
+    normalizeTerminalOutput(result.stdout),
+    normalizeTerminalOutput(result.stderr)
+  ].filter(Boolean).join("\n");
+  return result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+}
+function detectFittedTruncation(blocks, bodyBudget, bodyByteBudget, separator) {
+  const truncated = /* @__PURE__ */ new Set();
+  if (blocks.length === 0) return truncated;
+  const joined = blocks.join(separator);
+  const sepChars = separator.length * (blocks.length - 1);
+  const sepBytes = Buffer.byteLength(separator, "utf8") * (blocks.length - 1);
+  if (joined.length > bodyBudget) {
+    if (sepChars >= bodyBudget) {
+      for (let i = 0; i < blocks.length; i++) truncated.add(i);
+    } else {
+      const charBudgets = computeWaterFillBudgets(
+        blocks.map((b) => b.length),
+        bodyBudget - sepChars
+      );
+      for (let i = 0; i < blocks.length; i++) {
+        if (blocks[i].length > (charBudgets[i] ?? 0)) {
+          truncated.add(i);
+        }
+      }
+    }
+  }
+  const charFitted = fitSectionsToBudget(blocks, bodyBudget, separator);
+  if (Buffer.byteLength(charFitted, "utf8") > bodyByteBudget) {
+    if (sepBytes >= bodyByteBudget) {
+      for (let i = 0; i < blocks.length; i++) truncated.add(i);
+    } else {
+      const byteBudgets = computeWaterFillBudgets(
+        blocks.map((b) => Buffer.byteLength(b, "utf8")),
+        bodyByteBudget - sepBytes
+      );
+      for (let i = 0; i < blocks.length; i++) {
+        if (Buffer.byteLength(blocks[i], "utf8") > (byteBudgets[i] ?? 0)) {
+          truncated.add(i);
+        }
+      }
+    }
+  }
+  return truncated;
+}
+function renderRunChecksBody(outcomes, outputMode, bodyBudget, bodyByteBudget, separator) {
+  const truncatedOutcomeIndices = /* @__PURE__ */ new Set();
+  let spillTriggered = false;
   let blocks;
   if (outputMode === "full") {
     blocks = outcomes.map(({ spec, result, passed }) => {
       if (!result) return `## [NOT RUN] ${spec.name}
 $ ${spec.command}`;
       const badge = result.error ? "ERROR" : result.timedOut ? "TIMEOUT" : passed ? "PASS" : `FAIL (exit ${result.exitCode ?? "err"})`;
-      const combined = [
-        normalizeTerminalOutput(result.stdout),
-        normalizeTerminalOutput(result.stderr)
-      ].filter(Boolean).join("\n");
-      const body = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+      const body = buildNormalizedCommandOutput(result);
       return `## [${badge}] ${spec.name} (${result.durationMs}ms)
 $ ${spec.command}
 ${body}`;
@@ -6737,14 +7398,14 @@ $ ${spec.command}`;
         continue;
       }
       if (passed) {
-        const body = formatCompactCommandOutput({
+        const body = formatCompactCommandOutputWithMeta({
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.exitCode,
           timedOut: result.timedOut,
           error: result.error,
           maxChars: 300
-        });
+        }).text;
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
         const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
         blocks[i] = fullBlock;
@@ -6762,7 +7423,7 @@ $ ${spec.command}`;
         bodyBudget,
         result.stdout.length + result.stderr.length + 256
       );
-      const pass1Body = formatCompactCommandOutput({
+      const pass1Meta = formatCompactCommandOutputWithMeta({
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
@@ -6776,8 +7437,9 @@ $ ${spec.command}`;
         result,
         badgeLine,
         header,
-        pass1Body,
-        pass1Block: `${header}${pass1Body}`
+        pass1Meta,
+        pass1Body: pass1Meta.text,
+        pass1Block: `${header}${pass1Meta.text}`
       });
     }
     if (failEntries.length > 0) {
@@ -6879,6 +7541,8 @@ $ ${spec.command}`;
                     shareBytes
                   );
                 }
+                truncatedOutcomeIndices.add(p.index);
+                spillTriggered = true;
               }
             }
             blocks[p.index] = shrunk;
@@ -6922,58 +7586,90 @@ $ ${spec.command}`;
         const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
         const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
         const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
+        let finalMeta;
+        let failHardTruncated = false;
         if (entry.pass1Body.length <= allowedBodyChars && pass1BodyBytes <= allowedBodyBytes) {
+          finalMeta = entry.pass1Meta;
           blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
-          continue;
-        }
-        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
-        let targetChars = Math.min(
-          allowedBodyChars,
-          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar))
-        );
-        let compactedBody = targetChars > 0 ? formatCompactCommandOutput({
-          stdout: entry.result.stdout,
-          stderr: entry.result.stderr,
-          exitCode: entry.result.exitCode,
-          timedOut: entry.result.timedOut,
-          error: entry.result.error,
-          maxChars: targetChars
-        }) : "";
-        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
-          const curBytes = Buffer.byteLength(compactedBody, "utf8");
-          if (curBytes <= allowedBodyBytes) break;
-          targetChars = Math.max(
-            1,
-            Math.min(
-              targetChars - 1,
-              Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98)
-            )
+        } else {
+          failHardTruncated = true;
+          const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+          let targetChars = Math.min(
+            allowedBodyChars,
+            Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar))
           );
-          compactedBody = formatCompactCommandOutput({
+          finalMeta = targetChars > 0 ? formatCompactCommandOutputWithMeta({
             stdout: entry.result.stdout,
             stderr: entry.result.stderr,
             exitCode: entry.result.exitCode,
             timedOut: entry.result.timedOut,
             error: entry.result.error,
             maxChars: targetChars
-          });
+          }) : {
+            text: "",
+            collapsedLines: entry.pass1Meta.collapsedLines,
+            truncated: true,
+            rawLines: entry.pass1Meta.rawLines,
+            rawChars: entry.pass1Meta.rawChars
+          };
+          for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+            const curBytes = Buffer.byteLength(finalMeta.text, "utf8");
+            if (curBytes <= allowedBodyBytes) break;
+            targetChars = Math.max(
+              1,
+              Math.min(
+                targetChars - 1,
+                Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98)
+              )
+            );
+            finalMeta = formatCompactCommandOutputWithMeta({
+              stdout: entry.result.stdout,
+              stderr: entry.result.stderr,
+              exitCode: entry.result.exitCode,
+              timedOut: entry.result.timedOut,
+              error: entry.result.error,
+              maxChars: targetChars
+            });
+          }
+          blocks[entry.index] = `${effectiveHeader}${finalMeta.text}`;
         }
-        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        const otherFailChars = failEntries.reduce(
+          (sum, f, idx) => idx === j ? sum : sum + f.pass1Block.length,
+          0
+        );
+        const availableBodyCeiling = Math.max(
+          allowedBodyChars,
+          failPoolChars - otherFailChars - headerChars,
+          Math.floor(failPoolChars / failEntries.length) - headerChars
+        );
+        if (failHardTruncated || finalMeta.truncated || finalMeta.collapsedLines >= 20 || finalMeta.rawChars > availableBodyCeiling) {
+          spillTriggered = true;
+          truncatedOutcomeIndices.add(entry.index);
+        }
       }
     }
   }
-  const fittedBlocks = fitSectionsToByteBudget(
+  const fitTruncated = detectFittedTruncation(
     blocks,
     bodyBudget,
     bodyByteBudget,
     separator
   );
-  let text = truncateWithNotice(
-    `${summaryHeader}${separator}${fittedBlocks}`,
-    maxChars
+  if (fitTruncated.size > 0) {
+    for (const idx of fitTruncated) {
+      if (outcomes[idx]?.result) {
+        truncatedOutcomeIndices.add(idx);
+        spillTriggered = true;
+      }
+    }
+  }
+  const fittedBody = fitSectionsToByteBudget(
+    blocks,
+    bodyBudget,
+    bodyByteBudget,
+    separator
   );
-  text = truncateWithByteNotice(text, maxBytes);
-  return { text, isError: false };
+  return { fittedBody, spillTriggered, truncatedOutcomeIndices };
 }
 function clampInt2(val, min, max, fallback) {
   if (typeof val !== "number" && typeof val !== "string") return fallback;
@@ -7099,10 +7795,10 @@ function createAgyFastServer(options = {}) {
       };
     }
     const isHomePath = rawCwd === "~" || rawCwd.startsWith("~/") || rawCwd.startsWith("~\\");
-    if (defaultCwd && !path7.isAbsolute(rawCwd) && !isHomePath) {
+    if (defaultCwd && !path9.isAbsolute(rawCwd) && !isHomePath) {
       return {
         ok: true,
-        value: { ...args, cwd: path7.resolve(defaultCwd, rawCwd) }
+        value: { ...args, cwd: path9.resolve(defaultCwd, rawCwd) }
       };
     }
     return { ok: true, value: { ...args, cwd: rawCwd } };
@@ -7120,7 +7816,7 @@ function createAgyFastServer(options = {}) {
     onWorkspaceRoots: (paths) => {
       for (const candidate of paths) {
         try {
-          if (fs6.statSync(candidate).isDirectory()) {
+          if (fs7.statSync(candidate).isDirectory()) {
             defaultCwd = candidate;
             return;
           }
