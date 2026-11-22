@@ -512,10 +512,13 @@ describe("read_slices", () => {
     const outlineRes = await runReadSlices({ cwd: tmpDir, outlines: paths });
     assert.equal(outlineRes.isError, false);
     assert.ok(Buffer.byteLength(outlineRes.text, "utf8") <= 8_800);
-    // Depth-0 tailHelper must survive even though HugeStore has 60 methods
+    // Water-filling returns unused budget from the 23 tiny sibling files to f0.ts,
+    // preserving all 60 methods + depth-0 tailHelper + fn23 without premature cuts
+    assert.match(outlineRes.text, /method0/);
+    assert.match(outlineRes.text, /method59/);
     assert.match(outlineRes.text, /tailHelper/);
     assert.match(outlineRes.text, /fn23/);
-    assert.match(outlineRes.text, /\(\+52 more symbols\)/);
+    assert.doesNotMatch(outlineRes.text, /omitted/);
 
     const tooMany = await runReadSlices({
       cwd: tmpDir,
@@ -563,6 +566,7 @@ describe("read_slices", () => {
       `Expected <= 8800B, got ${Buffer.byteLength(denseRes.text, "utf8")}`,
     );
     assert.match(denseRes.text, /module_29\.ts/);
+    assert.match(denseRes.text, /more top-level symbols in L\d+-L25 omitted; use batch_search or read_file/);
     assert.match(denseRes.text, /batch 10-20 files per call/);
   });
 
@@ -848,5 +852,550 @@ describe("read_slices", () => {
       false,
       "read_slices output must not contain lone UTF-16 surrogates",
     );
+  });
+
+  it("extracts .html and .htm closed-range outlines with void tags, comments, container filtering, inline script/style recursion, and malformed recovery", async () => {
+    const htmlDoc = [
+      "<!DOCTYPE html>", // 1
+      '<html lang="en">', // 2
+      "  <head>", // 3
+      '    <meta charset="utf-8">', // 4
+      '    <link rel="stylesheet" href="/app.css">', // 5
+      "    <style>", // 6
+      "      /* === Theme Tokens === */", // 7
+      "      :root {", // 8
+      "        --accent: #09f;", // 9
+      "      }", // 10
+      "      @media (max-width: 768px) {", // 11
+      "        body { font-size: 14px; }", // 12
+      "      }", // 13
+      "    </style>", // 14
+      '    <script src="/vendor/bundle.js"></script>', // 15
+      "  </head>", // 16
+      "  <body>", // 17
+      "    <!-- === Header === -->", // 18
+      '    <header class="flex items-center px-4">', // 19
+      '      <nav role="navigation" class="gap-2">', // 20
+      '        <ul class="list-none flex">', // 21 (plain class -> excluded)
+      '          <li><img src="/logo.png" alt="Logo"><br></li>', // 22
+      "        </ul>", // 23
+      "      </nav>", // 24
+      "    </header>", // 25
+      "    <!--", // 26
+      '      <section id="commented-out">', // 27
+      '        <div id="fake-inside-comment">ignored</div>', // 28
+      "      </section>", // 29
+      "    -->", // 30
+      '    <!-- <div id="single-line-commented">nope</div> -->', // 31
+      "    <!-- Sidebar -->", // 32
+      '    <div class="tailwind-wrapper flex flex-col">', // 33 (plain class -> excluded)
+      '      <div data-id="not-id" class="noise">', // 34 (data-id != id -> excluded)
+      '        <div id="app" class="container">', // 35
+      '          <div data-testid="toolbar" title="a > b && c < d" data-expr=\'x >= 1\'>', // 36
+      '            <input type="text" name="q" />', // 37
+      "          </div>", // 38
+      "          <main>", // 39
+      "            <section", // 40
+      '              id="settings"', // 41
+      '              class="p-6"', // 42
+      "            >", // 43
+      '              <form id="prefs-form">', // 44
+      '                <fieldset data-testid="billing-fields">', // 45
+      '                  <input type="checkbox" name="auto">', // 46
+      "                </fieldset>", // 47
+      "              </form>", // 48
+      "            </section>", // 49
+      "          </main>", // 50
+      "        </div>", // 51
+      "      </div>", // 52
+      "    </div>", // 53
+      '    <script type="module">', // 54
+      "      function bootApp() {", // 55
+      '        return "<div>not a tag</div>";', // 56
+      "      }", // 57
+      "      class Controller {", // 58
+      "        init() {", // 59
+      "          return bootApp();", // 60
+      "        }", // 61
+      "      }", // 62
+      "    </script>", // 63
+      "  </body>", // 64
+      "</html>", // 65
+    ].join("\n");
+
+    const htmlSyms = extractSymbols("index.html", htmlDoc);
+    const htmSyms = extractSymbols("legacy.htm", htmlDoc);
+    assert.deepEqual(htmSyms, htmlSyms);
+
+    // Every symbol stays within depth 0..2 and has valid closed range
+    assert.ok(htmlSyms.every((s) => s.depth >= 0 && s.depth <= 2));
+    assert.ok(htmlSyms.every((s) => s.endLine >= s.startLine));
+
+    // Exact key blocks and labels
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<head>" && s.startLine === 3 && s.endLine === 16 && s.depth === 0));
+    assert.ok(htmlSyms.some((s) => s.kind === "style" && s.name === "<style>" && s.startLine === 6 && s.endLine === 14 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "section" && s.name === "Theme Tokens" && s.startLine === 7 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "tokens" && s.name === ":root" && s.startLine === 8 && s.endLine === 10 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "@media" && s.startLine === 11 && s.endLine === 13 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "script" && s.name === '<script src="/vendor/bundle.js">' && s.startLine === 15 && s.endLine === 15 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<body>" && s.startLine === 17 && s.endLine === 64 && s.depth === 0));
+    assert.ok(htmlSyms.some((s) => s.kind === "section" && s.name === "Header" && s.startLine === 18 && s.endLine === 18 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<header>" && s.startLine === 19 && s.endLine === 25 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === '<nav role="navigation">' && s.startLine === 20 && s.endLine === 24 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "section" && s.name === "Sidebar" && s.startLine === 32 && s.endLine === 32 && s.depth === 1));
+    // Wrapper plain-class divs and data-id div must NOT increment depth or appear
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<div #app>" && s.startLine === 35 && s.endLine === 51 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === '<div data-testid="toolbar">' && s.startLine === 36 && s.endLine === 38 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<section #settings>" && s.startLine === 40 && s.endLine === 49 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === "<form #prefs-form>" && s.startLine === 44 && s.endLine === 48 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "block" && s.name === '<fieldset data-testid="billing-fields">' && s.startLine === 45 && s.endLine === 47 && s.depth === 2));
+    // Inline script recursive JS symbols with exact line offsets
+    assert.ok(htmlSyms.some((s) => s.kind === "script" && s.name === '<script type="module">' && s.startLine === 54 && s.endLine === 63 && s.depth === 1));
+    assert.ok(htmlSyms.some((s) => s.kind === "function" && s.name === "bootApp" && s.startLine === 55 && s.endLine === 57 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "class" && s.name === "Controller" && s.startLine === 58 && s.endLine === 62 && s.depth === 2));
+    assert.ok(htmlSyms.some((s) => s.kind === "method" && s.name === "init" && s.startLine === 59 && s.endLine === 61 && s.depth === 2));
+
+    // Exclusions: plain class containers, data-id, commented-out tags, external script contents
+    assert.ok(!htmlSyms.some((s) => s.name.includes("tailwind-wrapper") || s.name.includes("list-none")));
+    assert.ok(!htmlSyms.some((s) => s.name.includes("not-id")));
+    assert.ok(!htmlSyms.some((s) => s.name.includes("commented-out") || s.name.includes("fake-inside-comment") || s.name.includes("single-line-commented")));
+
+    // External <script src=...> with stray inner text must NOT recurse into JS
+    const extScriptSyms = extractSymbols(
+      "ext.html",
+      ['<script src="app.js">', "function shouldNotBeParsed() { return 1; }", "</script>"].join("\n"),
+    );
+    assert.deepEqual(
+      extScriptSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ['script:<script src="app.js">:1-3'],
+    );
+
+    // Single-line inline <script> and <style> preserve exact line numbers
+    const oneLineInline = extractSymbols(
+      "inline.html",
+      [
+        "<style>:root { --x: 1; }</style>",
+        "<script>function quickRun() { return 1; }</script>",
+      ].join("\n"),
+    );
+    assert.ok(oneLineInline.some((s) => s.kind === "tokens" && s.name === ":root" && s.startLine === 1 && s.endLine === 1));
+    assert.ok(oneLineInline.some((s) => s.kind === "function" && s.name === "quickRun" && s.startLine === 2 && s.endLine === 2));
+
+    // Resilient recovery for unclosed & mismatched tags
+    const brokenHtml = [
+      "<main>", // 1
+      '  <section id="broken">', // 2
+      '    <div id="unclosed-div">', // 3
+      "      <p>unclosed paragraph", // 4
+      "      </span>", // 5 (stray close tag)
+      "  </section>", // 6 (unwinds unclosed-div to L5)
+      '  <aside id="intact">', // 7
+      "    <p>still works</p>", // 8
+      "  </aside>", // 9
+      '  <footer id="eof-open">', // 10 (unclosed at EOF -> L10-L11)
+      "    <span>tail</span>", // 11
+    ].join("\n");
+    const brokenSyms = extractSymbols("broken.html", brokenHtml);
+    assert.ok(brokenSyms.every((s) => s.endLine >= s.startLine));
+    assert.deepEqual(
+      brokenSyms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<main>:1-11:d0",
+        "<section #broken>:2-6:d1",
+        "<div #unclosed-div>:3-5:d2",
+        "<aside #intact>:7-9:d1",
+        "<footer #eof-open>:10-11:d1",
+      ],
+    );
+  });
+
+  it("unifies Vue and Svelte template outlining with closed ranges, short/deeply-indented templates, and component landmarks", async () => {
+    // Short Vue template (<30 lines) with >8-space indentation and >14 landmarks
+    const shortVue = [
+      '<script setup lang="ts">', // 1
+      "function saveSettings() {", // 2
+      "  return true;", // 3
+      "}", // 4
+      "</script>", // 5
+      "<template>", // 6
+      '  <div class="outer">', // 7 (plain class -> skipped)
+      '    <div class="inner">', // 8
+      '      <div class="deep">', // 9
+      '          <section id="general" @click="count > 0 && saveSettings()">', // 10 (10 spaces!)
+      "            <SettingsModal />", // 11 (12 spaces!)
+      "            <NavDrawer>", // 12
+      "              <ProfileTab />", // 13
+      "            </NavDrawer>", // 14
+      "            <DashboardView />", // 15
+      "            <LoginPage />", // 16
+      "            <CheckoutForm />", // 17
+      "            <SidePanel />", // 18
+      "            <AlertDialog />", // 19
+      "            <PlainButton />", // 20 (NOT a landmark suffix -> excluded)
+      "          </section>", // 21
+      "      </div>", // 22
+      "    </div>", // 23
+      "  </div>", // 24
+      "</template>", // 25
+    ].join("\n");
+
+    const vueSyms = extractSymbols("Settings.vue", shortVue);
+    assert.ok(vueSyms.some((s) => s.kind === "template" && s.startLine === 6 && s.endLine === 25 && s.depth === 0));
+    assert.ok(vueSyms.some((s) => s.kind === "block" && s.name === "<section #general>" && s.startLine === 10 && s.endLine === 21 && s.depth === 1));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<SettingsModal>" && s.startLine === 11 && s.endLine === 11 && s.depth === 2));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<NavDrawer>" && s.startLine === 12 && s.endLine === 14 && s.depth === 2));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<ProfileTab>" && s.startLine === 13 && s.endLine === 13 && s.depth === 2));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<DashboardView>" && s.startLine === 15));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<LoginPage>" && s.startLine === 16));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<CheckoutForm>" && s.startLine === 17));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<SidePanel>" && s.startLine === 18));
+    assert.ok(vueSyms.some((s) => s.kind === "component" && s.name === "<AlertDialog>" && s.startLine === 19));
+    assert.ok(!vueSyms.some((s) => s.name.includes("PlainButton")));
+    assert.ok(vueSyms.every((s) => s.depth <= 2));
+
+    // >14 landmarks inside a Vue template are ALL extracted (old 14-landmark cap removed)
+    const manyVueLandmarks = [
+      "<template>",
+      ...Array.from({ length: 20 }, (_, i) => `  <section id="sec-${i}"><p>${i}</p></section>`),
+      "</template>",
+    ].join("\n");
+    const manyVueSyms = extractSymbols("Many.vue", manyVueLandmarks);
+    const secSyms = manyVueSyms.filter((s) => s.name.startsWith("<section #sec-"));
+    assert.equal(secSyms.length, 20);
+    assert.equal(secSyms[19]?.name, "<section #sec-19>");
+
+    // Svelte without <template> wrapper (root markup + Svelte {a > b} expressions + script + style)
+    const svelteRoot = [
+      '<script lang="ts">', // 1
+      "  export let count = 0;", // 2
+      "  function increment() {", // 3
+      "    count += 1;", // 4
+      "  }", // 5
+      "</script>", // 6
+      "", // 7
+      "<main>", // 8
+      "  {#if count < 10}", // 9
+      '    <section id="counter">', // 10
+      "      <SettingsModal disabled={count > 5} />", // 11
+      "    </section>", // 12
+      "  {/if}", // 13
+      "</main>", // 14
+      "", // 15
+      "<style>", // 16
+      "  @media (max-width: 640px) {", // 17
+      "    main { padding: 8px; }", // 18
+      "  }", // 19
+      "</style>", // 20
+    ].join("\n");
+
+    const svelteSyms = extractSymbols("Counter.svelte", svelteRoot);
+    assert.ok(svelteSyms.some((s) => s.kind === "script" && s.startLine === 1 && s.endLine === 6 && s.depth === 0));
+    assert.ok(svelteSyms.some((s) => s.kind === "function" && s.name === "increment" && s.startLine === 3 && s.endLine === 5 && s.depth === 1));
+    assert.ok(svelteSyms.some((s) => s.kind === "block" && s.name === "<main>" && s.startLine === 8 && s.endLine === 14 && s.depth === 0));
+    assert.ok(svelteSyms.some((s) => s.kind === "block" && s.name === "<section #counter>" && s.startLine === 10 && s.endLine === 12 && s.depth === 1));
+    assert.ok(svelteSyms.some((s) => s.kind === "component" && s.name === "<SettingsModal>" && s.startLine === 11 && s.endLine === 11 && s.depth === 2));
+    assert.ok(svelteSyms.some((s) => s.kind === "style" && s.startLine === 16 && s.endLine === 20 && s.depth === 0));
+    assert.ok(svelteSyms.some((s) => s.kind === "@media" && s.startLine === 17 && s.endLine === 19 && s.depth === 1));
+
+    // Svelte WITH <template> wrapper (<30 lines, >8-space indent)
+    const svelteTpl = [
+      "<template>",
+      '          <section id="wrapped">',
+      "            <UserDialog />",
+      "          </section>",
+      "</template>",
+    ].join("\n");
+    const svelteTplSyms = extractSymbols("Wrapped.svelte", svelteTpl);
+    assert.deepEqual(
+      svelteTplSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "template:<template>:1-5:d0",
+        "block:<section #wrapped>:2-4:d1",
+        "component:<UserDialog>:3-3:d2",
+      ],
+    );
+  });
+
+  it("water-fills unused budget from small outline files to preserve all trailing symbols of a large file", async () => {
+    const wfDir = path.join(tmpDir, "waterfill-batch");
+    await fs.mkdir(wfDir, { recursive: true });
+    const paths: string[] = [];
+
+    for (let i = 0; i < 8; i++) {
+      const rel = `waterfill-batch/tiny_${i}.ts`;
+      paths.push(rel);
+      await fs.writeFile(
+        path.join(tmpDir, rel),
+        `export function tinyFn_${i}() { return ${i}; }\n`,
+        "utf8",
+      );
+    }
+
+    const largeRel = "waterfill-batch/large_module.ts";
+    paths.push(largeRel);
+    const largeBody = Array.from(
+      { length: 45 },
+      (_, i) => `export function moduleHandler_${String(i).padStart(2, "0")}() {\n  return ${i};\n}`,
+    ).join("\n");
+    await fs.writeFile(path.join(tmpDir, largeRel), largeBody, "utf8");
+
+    // 9 files total: old static perFileSymbolLimit cut at 30 symbols, dropping moduleHandler_30..44.
+    const res = await runReadSlices({ cwd: tmpDir, outlines: paths });
+    assert.equal(res.isError, false);
+    assert.ok(Buffer.byteLength(res.text, "utf8") <= 8_800);
+    for (let i = 0; i < 8; i++) {
+      assert.match(res.text, new RegExp(`tinyFn_${i}\\b`));
+    }
+    assert.match(res.text, /moduleHandler_00\b/);
+    assert.match(res.text, /moduleHandler_30\b/);
+    assert.match(res.text, /moduleHandler_44\b/);
+    assert.doesNotMatch(res.text, /omitted/);
+
+    // Piggybacked tiny slice + tiny outlines still returns unused budget to large outline
+    const mixedRes = await runReadSlices({
+      cwd: tmpDir,
+      outlines: paths,
+      slices: [{ path: "waterfill-batch/tiny_0.ts", ranges: [[1, 1]] }],
+    });
+    assert.equal(mixedRes.isError, false);
+    assert.ok(Buffer.byteLength(mixedRes.text, "utf8") <= 8_800);
+    assert.match(mixedRes.text, /moduleHandler_44\b/);
+    assert.match(mixedRes.text, /## Slice: waterfill-batch\/tiny_0\.ts/);
+  });
+
+  it("packs overflowing outlines breadth-first by ascending depth (depth 0 -> depth 1 -> depth 2)", async () => {
+    const bfDir = path.join(tmpDir, "breadth-first");
+    await fs.mkdir(bfDir, { recursive: true });
+
+    const classRel = "breadth-first/giant_class.ts";
+    const classBody = [
+      "export class GiantEngine {",
+      ...Array.from(
+        { length: 100 },
+        (_, i) => `  method_${String(i).padStart(3, "0")}() { return ${i}; }`,
+      ),
+      "}",
+      "export function trailingInit() { return 1; }",
+      "export function trailingSync() { return 2; }",
+      "export function trailingShutdown() { return 3; }",
+    ].join("\n");
+    await fs.writeFile(path.join(tmpDir, classRel), classBody, "utf8");
+
+    const res = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [classRel],
+      maxChars: 1_200,
+    });
+    assert.equal(res.isError, false);
+    assert.ok(res.text.length <= 1_200, `Expected <= 1200 chars, got ${res.text.length}`);
+    assert.ok(Buffer.byteLength(res.text, "utf8") <= 8_800);
+    // All depth-0 symbols (GiantEngine + all 3 trailing functions) must survive
+    assert.match(res.text, /\[class\] GiantEngine/);
+    assert.match(res.text, /\[function\] trailingInit/);
+    assert.match(res.text, /\[function\] trailingSync/);
+    assert.match(res.text, /\[function\] trailingShutdown/);
+    // Early depth-1 methods backfill remaining budget and render before trailing depth-0 functions
+    assert.match(res.text, /method_000\b/);
+    assert.doesNotMatch(res.text, /method_099\b/);
+    assert.ok(res.text.indexOf("method_000") < res.text.indexOf("trailingInit"));
+    assert.match(res.text, /\n\.\.\. \(\+\d+ nested symbols omitted\)$/);
+
+    // 3-level HTML breadth-first: depth 0 (<body>) + depth 1 (<header>, <main>, <footer>) survive before depth 2 children
+    const htmlRel = "breadth-first/deep_page.html";
+    const htmlBody = [
+      "<body>",
+      "  <header><p>top</p></header>",
+      "  <main>",
+      ...Array.from({ length: 80 }, (_, i) => `    <div id="row-${String(i).padStart(2, "0")}">x</div>`),
+      "  </main>",
+      "  <footer><p>bottom</p></footer>",
+      "</body>",
+    ].join("\n");
+    await fs.writeFile(path.join(tmpDir, htmlRel), htmlBody, "utf8");
+
+    const htmlRes = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [htmlRel],
+      maxChars: 1_100,
+    });
+    assert.equal(htmlRes.isError, false);
+    assert.ok(htmlRes.text.length <= 1_100);
+    assert.match(htmlRes.text, /<body>/);
+    assert.match(htmlRes.text, /<header>/);
+    assert.match(htmlRes.text, /<main>/);
+    assert.match(htmlRes.text, /<footer>/);
+    assert.match(htmlRes.text, /<div #row-00>/);
+    assert.doesNotMatch(htmlRes.text, /<div #row-79>/);
+    assert.ok(htmlRes.text.indexOf("<div #row-00>") < htmlRes.text.indexOf("<footer>"));
+    assert.match(htmlRes.text, /\n\.\.\. \(\+\d+ nested symbols omitted\)$/);
+  });
+
+  it("emits exact uncovered L<min>-L<max> footer and enforces <= 8800 UTF-8 bytes when depth-0 symbols overflow (ASCII and CJK)", async () => {
+    const giantDir = path.join(tmpDir, "giant-top");
+    await fs.mkdir(giantDir, { recursive: true });
+
+    // 1. ASCII giant file overflowing depth-0 (>8.5KB of top-level functions)
+    const asciiRel = "giant-top/many_funcs.ts";
+    const asciiLines: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      asciiLines.push(`export function computePipelineStage_${String(i).padStart(3, "0")}() {`);
+      asciiLines.push(`  return ${i};`);
+      asciiLines.push("}");
+    }
+    await fs.writeFile(path.join(tmpDir, asciiRel), asciiLines.join("\n"), "utf8");
+
+    const asciiRes = await runReadSlices({ cwd: tmpDir, outlines: [asciiRel] });
+    assert.equal(asciiRes.isError, false);
+    assert.ok(
+      Buffer.byteLength(asciiRes.text, "utf8") <= 8_800,
+      `Expected <= 8800B, got ${Buffer.byteLength(asciiRes.text, "utf8")}`,
+    );
+    const asciiMatch =
+      /\n\.\.\. \(\+(\d+) more top-level symbols in L(\d+)-L(\d+) omitted; use batch_search or read_file\)$/.exec(
+        asciiRes.text,
+      );
+    assert.ok(asciiMatch, `Expected top-level range footer, got:\n${asciiRes.text.slice(-300)}`);
+    const omittedCount = Number(asciiMatch[1]);
+    const minStart = Number(asciiMatch[2]);
+    const maxEnd = Number(asciiMatch[3]);
+    assert.ok(omittedCount > 0 && omittedCount < 300);
+    // Exact uncovered line range: first omitted function starts at (300 - omittedCount)*3 + 1, last ends at 900
+    assert.equal(minStart, (300 - omittedCount) * 3 + 1);
+    assert.equal(maxEnd, 900);
+
+    // 2. CJK giant file overflowing UTF-8 byte budget (3 bytes/CJK char)
+    const cjkRel = "giant-top/cjk_spec.md";
+    const cjkLines: string[] = [];
+    for (let i = 0; i < 260; i++) {
+      cjkLines.push(`# 第${String(i + 1).padStart(3, "0")}章_核心系统架构设计规范与接口说明`);
+      cjkLines.push("正文内容。");
+    }
+    await fs.writeFile(path.join(tmpDir, cjkRel), cjkLines.join("\n"), "utf8");
+
+    const cjkRes = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [cjkRel],
+      maxChars: 8_800,
+    });
+    assert.equal(cjkRes.isError, false);
+    const cjkBytes = Buffer.byteLength(cjkRes.text, "utf8");
+    assert.ok(cjkBytes <= 8_800, `Expected <= 8800 UTF-8 bytes, got ${cjkBytes}`);
+    assert.equal(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cjkRes.text),
+      false,
+      "CJK outline must not contain lone surrogates",
+    );
+    const cjkMatch =
+      /\n\.\.\. \(\+(\d+) more top-level symbols in L(\d+)-L(\d+) omitted; use batch_search or read_file\)$/.exec(
+        cjkRes.text,
+      );
+    assert.ok(cjkMatch, `Expected CJK top-level range footer, got:\n${cjkRes.text.slice(-300)}`);
+    const cjkOmitted = Number(cjkMatch[1]);
+    assert.equal(Number(cjkMatch[2]), (260 - cjkOmitted) * 2 + 1);
+    assert.equal(Number(cjkMatch[3]), 520);
+  });
+
+  it("handles comment ReDoS inputs, unspaced '<' comparisons & apostrophes, astral emoji labels, compact <style>, and ##-only Markdown top-level overflow", async () => {
+    // 1. P0-1: linear-time comment landmark trimming (no quadratic backtracking)
+    const hugeComment = `<!-- a ${" ".repeat(50_000)} b -->\n<main><p>ok</p></main>`;
+    const t0 = performance.now();
+    const commentSyms = extractSymbols("redos.html", hugeComment);
+    const elapsedMs = performance.now() - t0;
+    assert.ok(elapsedMs < 200, `Expected linear-time parsing (<200ms), got ${elapsedMs.toFixed(1)}ms`);
+    assert.deepEqual(
+      commentSyms.map((s) => `${s.kind}:${s.name}:${s.startLine}-${s.endLine}`),
+      ["block:<main>:2-2"],
+    );
+
+    // 2. P1-2 Repro A: unspaced `<` comparison in Svelte {#if a<b && ok} must not swallow next tag
+    const svelteCmp = [
+      "<main>",
+      "  {#if a<b && ok}",
+      '    <section id="counter">',
+      "      <SettingsModal />",
+      "    </section>",
+      "  {/if}",
+      "</main>",
+    ].join("\n");
+    const cmpSyms = extractSymbols("Cmp.svelte", svelteCmp);
+    assert.deepEqual(
+      cmpSyms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<main>:1-7:d0",
+        "<section #counter>:3-5:d1",
+        "<SettingsModal>:4-4:d2",
+      ],
+    );
+
+    // 3. P1-2 Repro B: prose with unspaced `<` and apostrophe(s) must not drop subsequent landmarks
+    const proseApos = [
+      "<main>",
+      "  <p>when a<b it's broken</p>",
+      '  <section id="after"><p>it\'s ok</p></section>',
+      "</main>",
+    ].join("\n");
+    const proseSyms = extractSymbols("prose.html", proseApos);
+    assert.deepEqual(
+      proseSyms.map((s) => `${s.name}:${s.startLine}-${s.endLine}:d${s.depth}`),
+      [
+        "<main>:1-4:d0",
+        "<section #after>:3-3:d1",
+      ],
+    );
+
+    // 4. P1-4: astral-plane emoji in id/data-testid/role/script attrs never produce lone UTF-16 surrogates
+    const astral = "a" + "🚀".repeat(20);
+    const emojiHtml = [
+      `<div id="${astral}">id</div>`,
+      `<div data-testid="${astral}">tid</div>`,
+      `<nav role="${astral}">role</nav>`,
+      `<script data-note="${astral}"></script>`,
+    ].join("\n");
+    const emojiSyms = extractSymbols("emoji.html", emojiHtml);
+    assert.equal(emojiSyms.length, 4);
+    for (const sym of emojiSyms) {
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(sym.name),
+        false,
+        `Lone UTF-16 surrogate found in label: ${JSON.stringify(sym.name)}`,
+      );
+    }
+
+    // 5. P2-2: inline <style> uses compact CSS mode (keeps :root/@media, omits arbitrary plain rules)
+    const compactStyleHtml = [
+      "<style>",
+      "  .plain-card { padding: 8px; }",
+      "  :root { --accent: #09f; }",
+      "</style>",
+    ].join("\n");
+    const styleSyms = extractSymbols("style.html", compactStyleHtml);
+    assert.deepEqual(
+      styleSyms.map((s) => `${s.kind}:${s.name}`),
+      ["style:<style>", "tokens::root"],
+    );
+
+    // 6. P2-1: ##-only Markdown (minDepth === 1) emits L<min>-L<max> top-level omission footer
+    const h2OnlyRel = "giant-top/h2_only.md";
+    const h2Lines: string[] = [];
+    for (let i = 0; i < 80; i++) {
+      h2Lines.push(`## Section_${String(i).padStart(2, "0")}_LongHeadingForBudgetTest`);
+      h2Lines.push("Body paragraph.");
+    }
+    await fs.writeFile(path.join(tmpDir, h2OnlyRel), h2Lines.join("\n"), "utf8");
+    const h2Res = await runReadSlices({
+      cwd: tmpDir,
+      outlines: [h2OnlyRel],
+      maxChars: 1_200,
+    });
+    assert.equal(h2Res.isError, false);
+    assert.ok(h2Res.text.length <= 1_200);
+    const h2Match =
+      /\n\.\.\. \(\+(\d+) more top-level symbols in L(\d+)-L(\d+) omitted; use batch_search or read_file\)$/.exec(
+        h2Res.text,
+      );
+    assert.ok(h2Match, `Expected top-level range footer for ##-only doc, got:\n${h2Res.text.slice(-300)}`);
+    const h2Omitted = Number(h2Match[1]);
+    assert.equal(Number(h2Match[2]), (80 - h2Omitted) * 2 + 1);
+    assert.equal(Number(h2Match[3]), 160);
   });
 });
