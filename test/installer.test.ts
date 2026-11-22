@@ -30,6 +30,8 @@ describe("installer", () => {
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, USERPROFILE: homeDir };
     delete env.GEMINI_HOME;
     delete env.ANTIGRAVITY_APP_DATA_DIR;
+    delete env.AGY_FAST_CACHE_DIR;
+    delete env.AGY_FAST_SPILL;
     for (const [k, v] of Object.entries(extra)) {
       if (v === undefined) delete env[k];
       else env[k] = v;
@@ -510,6 +512,140 @@ describe("installer", () => {
     } finally {
       await fs.unlink(linkHome).catch(() => {});
       await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("configures --spill via config/install, rejects invalid values, and reports spill cache status & file count in doctor", async () => {
+    const spillHome = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-spill-home-"));
+    const spillCacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-spill-cache-"));
+    const cfgPath = path.join(spillCacheDir, "config.json");
+    const spillDir = path.join(spillCacheDir, "spill");
+    const baseEnv = makeIsolatedEnv(spillHome, { AGY_FAST_CACHE_DIR: spillCacheDir });
+
+    const run = (args: string[], extraEnv: Record<string, string | undefined> = {}) =>
+      execFileSync(process.execPath, [INSTALL_SCRIPT, ...args], {
+        env: makeIsolatedEnv(spillHome, { AGY_FAST_CACHE_DIR: spillCacheDir, ...extraEnv }),
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+
+    try {
+      // Help documents --spill on|off
+      assert.match(run(["--help"]), /--spill on\|off/);
+
+      // Default config reports spill: on before config.json exists
+      assert.match(run(["config"]), /- spill\s+:\s+on/);
+
+      // config --spill off persists "off" and displays it
+      const offOut = run(["config", "--spill", "off"]);
+      assert.match(offOut, /- spill\s+:\s+off/);
+      assert.equal(JSON.parse(await fs.readFile(cfgPath, "utf8")).spill, "off");
+
+      // config --spill ON (case-insensitive) persists "on" and displays it
+      const onOut = run(["config", "--spill", "ON"]);
+      assert.match(onOut, /- spill\s+:\s+on/);
+      assert.equal(JSON.parse(await fs.readFile(cfgPath, "utf8")).spill, "on");
+
+      // Invalid and missing --spill values exit non-zero with clear error
+      for (const badArgs of [["config", "--spill", "invalid"], ["config", "--spill"]]) {
+        assert.throws(() => run(badArgs), (err: unknown) => {
+          assert.match(
+            String((err as { stderr?: string })?.stderr ?? ""),
+            /Invalid value after --spill \(expected: on \| off\)/,
+          );
+          return true;
+        });
+      }
+
+      // install --spill off persists "spill": "off" and prints it in post-install doctor
+      const installOut = run(["install", "--no-enable", "--spill", "off"]);
+      assert.equal(JSON.parse(await fs.readFile(cfgPath, "utf8")).spill, "off");
+      assert.ok(
+        installOut.includes(`Spill cache : off (${spillDir}; 0 file(s))`),
+        `Expected persisted off status in install doctor output, got:\n${installOut}`,
+      );
+
+      // doctor reflects persisted "off" and AGY_FAST_SPILL=on / 1 / true env overrides
+      const docOff = execFileSync(process.execPath, [INSTALL_SCRIPT, "doctor"], {
+        env: baseEnv,
+        encoding: "utf8",
+      });
+      assert.ok(docOff.includes(`Spill cache : off (${spillDir}; 0 file(s))`));
+      for (const truthy of ["on", "1", "true", "ON"]) {
+        const docEnvOn = run(["doctor"], { AGY_FAST_SPILL: truthy });
+        assert.ok(docEnvOn.includes(`Spill cache : on (${spillDir}; 0 file(s))`));
+      }
+
+      // Switch config back to "on" and verify doctor default/on and AGY_FAST_SPILL=off/0/false override
+      run(["config", "--spill", "on"]);
+      const docOn = run(["doctor"]);
+      assert.ok(docOn.includes(`Spill cache : on (${spillDir}; 0 file(s))`));
+      for (const falsy of ["off", "0", "false", "OFF"]) {
+        const docEnvOff = run(["doctor"], { AGY_FAST_SPILL: falsy });
+        assert.ok(docEnvOff.includes(`Spill cache : off (${spillDir}; 0 file(s))`));
+      }
+      // Garbage env override falls back cleanly to persisted config
+      const docGarbage = run(["doctor"], { AGY_FAST_SPILL: "garbage" });
+      assert.ok(docGarbage.includes(`Spill cache : on (${spillDir}; 0 file(s))`));
+      assert.doesNotMatch(docGarbage, /garbage/);
+
+      // Defensive boolean & string-boolean values in config.json (false/"false"/"0" -> off, true/"true"/"1" -> on)
+      for (const falsyCfg of [false, "false", "0", "FALSE"]) {
+        await fs.writeFile(cfgPath, JSON.stringify({ spill: falsyCfg }), "utf8");
+        assert.match(run(["config"]), /- spill\s+:\s+off/);
+        assert.ok(run(["doctor"]).includes(`Spill cache : off (${spillDir}; 0 file(s))`));
+      }
+      for (const truthyCfg of [true, "true", "1", "TRUE"]) {
+        await fs.writeFile(cfgPath, JSON.stringify({ spill: truthyCfg }), "utf8");
+        assert.match(run(["config"]), /- spill\s+:\s+on/);
+        assert.ok(run(["doctor"]).includes(`Spill cache : on (${spillDir}; 0 file(s))`));
+      }
+
+      // doctor accurately counts matching spill .log files and ignores non-matching files & subdirs
+      await fs.mkdir(spillDir, { recursive: true });
+      await fs.writeFile(path.join(spillDir, "run_checks-20261122-095100-a1b2c3.log"), "ok", "utf8");
+      await fs.writeFile(path.join(spillDir, "batch-search-20261122-095101-ABCDEF.log"), "ok", "utf8");
+      await fs.writeFile(path.join(spillDir, "notes.txt"), "ignore", "utf8");
+      await fs.writeFile(path.join(spillDir, "unrelated.log"), "ignore", "utf8");
+      await fs.writeFile(path.join(spillDir, "run_checks-2026112-095100-a1b2c3.log"), "bad date", "utf8");
+      await fs.writeFile(path.join(spillDir, "run_checks-20261122-095100-zzzzzz.log"), "non hex", "utf8");
+      await fs.mkdir(path.join(spillDir, "apply_edits-20261122-095102-123456.log"), { recursive: true });
+
+      const docCount = run(["doctor"]);
+      assert.ok(
+        docCount.includes(`Spill cache : on (${spillDir}; 2 file(s))`),
+        `Expected 2 spill file(s) in doctor output, got:\n${docCount}`,
+      );
+
+      // Symlinked/junctioned parent cacheDir OR spillDir must return 0 (never follow symlinks)
+      const linkSandbox = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-spill-link-"));
+      const linkType = process.platform === "win32" ? "junction" : "dir";
+      const linkedCacheDir = path.join(linkSandbox, "cache-link");
+      const realCacheWithLinkedSpill = path.join(linkSandbox, "real-cache");
+      const linkedSpillDir = path.join(realCacheWithLinkedSpill, "spill");
+      try {
+        await fs.symlink(spillCacheDir, linkedCacheDir, linkType);
+        const docLinkedCache = run(["doctor"], { AGY_FAST_CACHE_DIR: linkedCacheDir });
+        assert.ok(
+          docLinkedCache.includes(`Spill cache : on (${path.join(linkedCacheDir, "spill")}; 0 file(s))`),
+          `Expected 0 spill file(s) for symlinked cacheDir, got:\n${docLinkedCache}`,
+        );
+
+        await fs.mkdir(realCacheWithLinkedSpill, { recursive: true });
+        await fs.symlink(spillDir, linkedSpillDir, linkType);
+        const docLinkedSpill = run(["doctor"], { AGY_FAST_CACHE_DIR: realCacheWithLinkedSpill });
+        assert.ok(
+          docLinkedSpill.includes(`Spill cache : on (${linkedSpillDir}; 0 file(s))`),
+          `Expected 0 spill file(s) for symlinked spillDir, got:\n${docLinkedSpill}`,
+        );
+      } finally {
+        await fs.unlink(linkedCacheDir).catch(() => {});
+        await fs.unlink(linkedSpillDir).catch(() => {});
+        await fs.rm(linkSandbox, { recursive: true, force: true });
+      }
+    } finally {
+      await fs.rm(spillHome, { recursive: true, force: true });
+      await fs.rm(spillCacheDir, { recursive: true, force: true });
     }
   });
 });

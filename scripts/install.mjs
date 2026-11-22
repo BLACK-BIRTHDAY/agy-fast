@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
 const PLUGIN_NAME = "agy-fast";
+const SPILL_FILENAME_RE = /^[a-z0-9_-]+-\d{8}-\d{6}-[0-9a-f]{6}\.log$/i;
 
 const RUNTIME_FILES = [
   "plugin.json",
@@ -52,6 +53,42 @@ function getUpdaterCacheDir() {
   return custom
     ? path.resolve(custom)
     : path.join(getHomeDir(), ".gemini", "cache", PLUGIN_NAME);
+}
+
+function parseSpillEnv(raw) {
+  const norm = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (norm === "off" || norm === "0" || norm === "false") return "off";
+  if (norm === "on" || norm === "1" || norm === "true") return "on";
+  return "";
+}
+
+function parseSpillConfig(val) {
+  if (val === false) return "off";
+  if (val === true) return "on";
+  if (typeof val === "string") {
+    return parseSpillEnv(val);
+  }
+  return "";
+}
+
+async function countSpillFiles(spillDir) {
+  try {
+    const cacheDir = path.dirname(spillDir);
+    const parentStat = await fs.lstat(cacheDir);
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) return 0;
+    const stat = await fs.lstat(spillDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return 0;
+    const entries = await fs.readdir(spillDir, { withFileTypes: true });
+    let count = 0;
+    for (const entry of entries) {
+      if (entry.isFile() && !entry.isSymbolicLink() && SPILL_FILENAME_RE.test(entry.name)) {
+        count++;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
 }
 
 async function readJsonSafe(filePath) {
@@ -103,6 +140,7 @@ function parseArgs(argv) {
   let channel = "";
   let repoUrl = "";
   let editsFormat = "";
+  let spill = "";
 
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -155,6 +193,12 @@ function parseArgs(argv) {
         );
       }
       editsFormat = args[++i].toLowerCase();
+    } else if (a === "--spill") {
+      const next = args[i + 1];
+      if (!next || !["on", "off"].includes(next.toLowerCase())) {
+        throw new Error("Invalid value after --spill (expected: on | off)");
+      }
+      spill = args[++i].toLowerCase();
     } else if (a === "--target") {
       const next = args[i + 1];
       if (!next || next.startsWith("-")) {
@@ -208,6 +252,7 @@ function parseArgs(argv) {
     channel,
     repoUrl,
     editsFormat,
+    spill,
   };
 }
 
@@ -239,6 +284,7 @@ Options:
   --repo <url>                  Override git repository URL for updates
   --edits-format auto|array|string
                                 Configure apply_edits.edits schema preference (default auto)
+  --spill on|off                Configure spill-to-file output cache (default on)
   -h, --help                    Show this help
 `);
 }
@@ -813,6 +859,12 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       : "";
   const hostEnvLabel =
     validHostOverride || process.env.ANTIGRAVITY_LS_VERSION?.trim() || "auto";
+  const effectiveSpill =
+    parseSpillEnv(process.env.AGY_FAST_SPILL) ||
+    parseSpillConfig(updaterCfg.spill) ||
+    "on";
+  const spillDir = path.join(cacheDir, "spill");
+  const spillCount = await countSpillFiles(spillDir);
 
   const isolatedProfiles = doctorOpts.checkIsolated
     ? await Promise.all(
@@ -822,6 +874,9 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
       )
     : [];
   report.isolatedProfiles = isolatedProfiles;
+  report.spill = effectiveSpill;
+  report.spillDir = spillDir;
+  report.spillFiles = spillCount;
 
   if (!quiet) {
     console.log("agy-fast health check:");
@@ -847,6 +902,9 @@ async function runDoctor(targetDir, quiet = false, doctorOpts = {}) {
         : "not checked yet";
     console.log(
       `  - Auto-update : ${effectiveAutoMode} (interval: ${effectiveInterval}h, channel: ${effectiveChannel}; ${checkSummary})`,
+    );
+    console.log(
+      `  - Spill cache : ${effectiveSpill} (${spillDir}; ${spillCount} file(s))`,
     );
     if (hasAgy) {
       console.log(
@@ -950,7 +1008,8 @@ async function runInstall(opts) {
     opts.intervalHours !== null ||
     opts.channel ||
     opts.repoUrl ||
-    opts.editsFormat
+    opts.editsFormat ||
+    opts.spill
   ) {
     const patch = {};
     if (opts.autoUpdate) patch.autoUpdate = opts.autoUpdate;
@@ -958,6 +1017,7 @@ async function runInstall(opts) {
     if (opts.channel) patch.channel = opts.channel;
     if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
     if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
+    if (opts.spill) patch.spill = opts.spill;
     await writeUpdaterConfigFile(patch);
   }
 
@@ -986,6 +1046,7 @@ async function runConfig(opts) {
   if (opts.channel) patch.channel = opts.channel;
   if (opts.repoUrl) patch.repoUrl = opts.repoUrl;
   if (opts.editsFormat) patch.editsFormat = opts.editsFormat;
+  if (opts.spill) patch.spill = opts.spill;
 
   let cfgPath = path.join(getUpdaterCacheDir(), "config.json");
   let cfg;
@@ -1004,6 +1065,7 @@ async function runConfig(opts) {
     console.log(`  - channel           : ${cfg.channel || "release"}`);
     console.log(`  - repoUrl           : ${cfg.repoUrl || "https://github.com/INK-Q/agy-fast.git"}`);
     console.log(`  - editsFormat       : ${cfg.editsFormat || "auto"}`);
+    console.log(`  - spill             : ${parseSpillConfig(cfg.spill) || "on"}`);
   }
 }
 
