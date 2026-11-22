@@ -178,6 +178,176 @@ describe("run_checks", () => {
     assert.match(ok.text, /\[PASS/);
   });
 
+  it("water-fills unused budget from empty commands to rich commands in full mode (no maxChars/N pre-cut)", async () => {
+    const richCmd = (tag: string) =>
+      `${nodeBin} -e "for (let i = 0; i < 60; i++) console.log('${tag}_LINE_' + String(i).padStart(2, '0') + '_' + 'x'.repeat(30));"`;
+
+    const res = await runChecks({
+      outputMode: "full",
+      maxChars: 8000,
+      concurrency: 4,
+      commands: [
+        { name: "empty-1", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-2", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-3", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "empty-4", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "rich-1", command: richCmd("RICH1") },
+        { name: "rich-2", command: richCmd("RICH2") },
+        { name: "rich-3", command: richCmd("RICH3") },
+        { name: "rich-4", command: richCmd("RICH4") },
+      ],
+    });
+
+    assert.equal(res.isError, false);
+    assert.ok(res.text.length <= 8000, `Exceeded maxChars: ${res.text.length}`);
+    assert.ok(Buffer.byteLength(res.text, "utf8") <= 8_800);
+    // Naive maxChars/8 would have capped each rich command below ~990 chars (< 23 lines).
+    // Water-filling donates unused budget from the 4 empty commands so each rich command gets > 1500 chars!
+    for (const tag of ["RICH1", "RICH2", "RICH3", "RICH4"]) {
+      const matches = res.text.match(new RegExp(`${tag}_LINE_\\d{2}_`, "g")) ?? [];
+      assert.ok(
+        matches.length >= 35,
+        `Expected >= 35 lines for ${tag} (proving budget flowed past maxChars/8), got ${matches.length}`,
+      );
+    }
+  });
+
+  it("uses tiered PASS+FAIL 2-pass water-filling in compact mode and enforces <= 8800 UTF-8 bytes with CJK", async () => {
+    const longFailScript = [
+      "console.log('> @app/web@1.0.0 build');",
+      "console.log('> vite build');",
+      "console.log('vite v5.4.0 building for production...');",
+      "console.log('transforming...');",
+      "console.log('✓ 40 modules transformed.');",
+      "console.log('rendering chunks...');",
+      "console.log('computing gzip size...');",
+      "for (let i = 0; i < 15; i++) console.log('dist/assets/chunk-' + i + '.js   12.34 kB │ gzip: 4.12 kB');",
+      "console.log('✓ built in 1.10s');",
+      "console.error('src/root.ts(1,1): error TS2304: FIRST_LONG_FAIL_ROOT');",
+      "for (let i = 0; i < 45; i++) console.error('src/mid-' + i + '.ts(10,2): error TS2322: cascade line ' + i + ' ' + 'a'.repeat(30));",
+      "console.error('src/end.ts(99,5): error TS2345: FINAL_LONG_FAIL_TAIL');",
+      "process.exit(1);",
+    ].join(" ");
+
+    const res = await runChecks({
+      outputMode: "compact",
+      maxChars: 2400,
+      commands: [
+        {
+          name: "pass-verbose",
+          command: `${nodeBin} -e "console.log('PASS_SUMMARY: ' + 'p'.repeat(420) + ' passed')"`,
+        },
+        {
+          name: "fail-short",
+          command: `${nodeBin} -e "console.error('Error: SHORT_FAIL_ONLY'); process.exit(1)"`,
+        },
+        {
+          name: "fail-long",
+          command: `${nodeBin} -e ${JSON.stringify(longFailScript)}`,
+        },
+      ],
+    });
+
+    assert.equal(res.isError, false);
+    assert.ok(res.text.length <= 2400, `Exceeded maxChars: ${res.text.length}`);
+    // PASS line stays capped <= 300 body chars
+    const passLine = res.text.split("\n").find((l) => l.includes("pass-verbose")) ?? "";
+    assert.ok(passLine.length > 0 && passLine.length < 440, `PASS line too long: ${passLine.length}`);
+    // Short FAIL stays intact and donates unused budget to fail-long
+    assert.match(res.text, /Error: SHORT_FAIL_ONLY/);
+    // Long FAIL keeps BOTH first root error AND final tail error and gets > 1400 chars (well above equal 1050 split)
+    assert.match(res.text, /FIRST_LONG_FAIL_ROOT/);
+    assert.match(res.text, /FINAL_LONG_FAIL_TAIL/);
+    const longFailSection = res.text.split("## [FAIL")[2] ?? "";
+    assert.ok(
+      longFailSection.length > 1400,
+      `Expected fail-long to receive water-filled budget > 1400 chars, got ${longFailSection.length}`,
+    );
+
+    // Strict <= 8,800 UTF-8 byte enforcement on CJK output in both compact & full modes
+    const cjkFailScript = [
+      "console.error('Error: 首个中文根因错误_CJK_ROOT');",
+      "for (let i = 0; i < 220; i++) console.error('Error: 中文编译报错详情行_' + i + '_类型不匹配需要检查字段定义和接口约束');",
+      "console.error('Error: 最终中文尾部错误_CJK_TAIL_END');",
+      "process.exit(1);",
+    ].join(" ");
+    const cjkCompact = await runChecks({
+      outputMode: "compact",
+      maxChars: 8000,
+      commands: [
+        { name: "cjk-fail", command: `${nodeBin} -e ${JSON.stringify(cjkFailScript)}` },
+      ],
+    });
+    assert.equal(cjkCompact.isError, false);
+    const compactBytes = Buffer.byteLength(cjkCompact.text, "utf8");
+    assert.ok(compactBytes <= 8_800, `Expected <= 8800 UTF-8 bytes, got ${compactBytes}`);
+    assert.match(cjkCompact.text, /首个中文根因错误_CJK_ROOT/);
+    assert.match(cjkCompact.text, /最终中文尾部错误_CJK_TAIL_END/);
+    assert.doesNotMatch(cjkCompact.text, /\uFFFD/);
+
+    const cjkFull = await runChecks({
+      outputMode: "full",
+      maxChars: 8000,
+      commands: [
+        { name: "cjk-full-1", command: `${nodeBin} -e "console.log('[]')"` },
+        { name: "cjk-full-2", command: `${nodeBin} -e ${JSON.stringify(cjkFailScript)}` },
+      ],
+    });
+    assert.equal(cjkFull.isError, false);
+    assert.ok(Buffer.byteLength(cjkFull.text, "utf8") <= 8_800);
+    assert.doesNotMatch(cjkFull.text, /\uFFFD/);
+  });
+
+  it("prevents PASS-heavy batches from starving FAIL output and prevents separator overshoot on tight all-fail batches", async () => {
+    // Repro A: 10 verbose PASS commands + 1 FAIL command (with a long command line) at maxChars: 2500
+    const passCmds = Array.from({ length: 10 }, (_, i) => ({
+      name: `pass-${i}`,
+      command: `${nodeBin} -e "console.log('PASS_${i}_SUMMARY: ' + 'p'.repeat(280) + ' passed')"`,
+    }));
+    const longFailCmd = `${nodeBin} -e "const pad = '${"x".repeat(140)}'; console.error('Error: STARVATION_GUARD_ROOT_CAUSE'); for (let i = 0; i < 8; i++) console.error('Error: detail line ' + i); console.error('Error: STARVATION_GUARD_TAIL_CAUSE'); process.exit(1);"`;
+
+    const resA = await runChecks({
+      outputMode: "compact",
+      maxChars: 2500,
+      concurrency: 4,
+      commands: [
+        ...passCmds,
+        { name: "sole-fail", command: longFailCmd },
+      ],
+    });
+    assert.equal(resA.isError, false);
+    assert.ok(resA.text.length <= 2500, `Exceeded maxChars: ${resA.text.length}`);
+    assert.ok(Buffer.byteLength(resA.text, "utf8") <= 8_800);
+    // FAIL command must NOT be starved to 0 error chars — both root & tail errors must survive
+    assert.match(resA.text, /STARVATION_GUARD_ROOT_CAUSE/);
+    assert.match(resA.text, /STARVATION_GUARD_TAIL_CAUSE/);
+    for (let i = 0; i < 10; i++) {
+      assert.match(resA.text, new RegExp(`\\[PASS \\d+ms\\] pass-${i}`));
+    }
+
+    // Repro B: 10 FAIL commands at tight maxChars: 550 must respect separator budget and preserve tail markers
+    const failCmds = Array.from({ length: 10 }, (_, i) => ({
+      name: `f${i}`,
+      command: `${nodeBin} -e "console.error('noise '.repeat(20) + '\\nTAIL_M${i}'); process.exit(1)"`,
+    }));
+    const resB = await runChecks({
+      outputMode: "compact",
+      maxChars: 550,
+      concurrency: 4,
+      commands: failCmds,
+    });
+    assert.equal(resB.isError, false);
+    assert.ok(resB.text.length <= 550, `Exceeded maxChars: ${resB.text.length}`);
+    assert.ok(Buffer.byteLength(resB.text, "utf8") <= 8_800);
+    for (let i = 0; i < 10; i++) {
+      assert.match(
+        resB.text,
+        new RegExp(`TAIL_M${i}`),
+        `Expected tail marker TAIL_M${i} to survive tight 10-fail batch:\n${resB.text}`,
+      );
+    }
+  });
+
   it("detects PowerShell syntax vs cross-platform commands and formats quoted executables", () => {
     assert.equal(
       needsPowerShellOnWindows('node "$env:USERPROFILE\\.gemini\\dist\\benchmark.mjs" --help'),

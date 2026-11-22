@@ -10,9 +10,12 @@ import { MCP_CALL_BUDGET_SEC, runShellCommandAsync, type ExecResult } from "../u
 import { resolvePath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
+  computeWaterFillBudgets,
   fitSectionsToByteBudget,
   formatCompactCommandOutput,
   normalizeTerminalOutput,
+  sliceSafeChars,
+  sliceUtf8Bytes,
   truncateWithByteNotice,
   truncateWithNotice,
 } from "../utils/output-filter.js";
@@ -240,77 +243,359 @@ export async function runChecks(
     );
   }
   const summaryHeader = `Checks: ${counts.join(", ")} (wall: ${wallMs}ms)`;
-
-  // Allocate larger output share to failing checks than passing checks
-  const usableChars = Math.max(200, maxChars - summaryHeader.length - 4);
-  const failedBudget =
-    failedCount > 0
-      ? Math.max(
-          160,
-          Math.floor((usableChars - passedCount * 120 - notRunCount * 100) / failedCount),
-        )
-      : 320;
-  const fullPerCmdBudget = Math.max(
-    160,
-    Math.floor(usableChars / outcomes.length),
+  const separator = "\n\n";
+  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - separator.length);
+  const bodyByteBudget = Math.max(
+    0,
+    maxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8"),
   );
 
-  const blocks = outcomes.map(({ spec, result, passed }) => {
-    if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
-    const badge = result.error
-      ? "ERROR"
-      : result.timedOut
-        ? "TIMEOUT"
-        : passed
-          ? "PASS"
-          : `FAIL (exit ${result.exitCode ?? "err"})`;
-
-    if (outputMode === "full") {
+  let blocks: string[];
+  if (outputMode === "full") {
+    blocks = outcomes.map(({ spec, result, passed }) => {
+      if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
+      const badge = result.error
+        ? "ERROR"
+        : result.timedOut
+          ? "TIMEOUT"
+          : passed
+            ? "PASS"
+            : `FAIL (exit ${result.exitCode ?? "err"})`;
       const combined = [
         normalizeTerminalOutput(result.stdout),
         normalizeTerminalOutput(result.stderr),
       ]
         .filter(Boolean)
         .join("\n");
-      const body = result.error
-        ? `spawn error: ${result.error}`
-        : truncateWithNotice(combined || "(no output)", fullPerCmdBudget);
+      const body = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
       return `## [${badge}] ${spec.name} (${result.durationMs}ms)\n$ ${spec.command}\n${body}`;
-    }
-
-    const body = formatCompactCommandOutput({
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      error: result.error,
-      maxChars: passed ? 300 : failedBudget,
     });
-
-    if (passed) {
-      return `- [PASS ${result.durationMs}ms] ${spec.name} (\`${spec.command}\`): ${body}`;
+  } else {
+    // Tiered budget pool + 2-pass water-filling:
+    // Fixed tier: PASS (concise 1-line summary <= 300 chars; yields budget if starving FAIL) + [NOT RUN]
+    // Elastic tier: FAIL / ERROR / TIMEOUT commands water-fill the remaining char & UTF-8 byte budget
+    blocks = new Array<string>(outcomes.length);
+    interface PassEntry {
+      index: number;
+      compactHeader: string;
+      body: string;
+      fullBlock: string;
     }
-    return `## [${badge} ${result.durationMs}ms] ${spec.name}\n$ ${spec.command}\n${body}`;
-  });
+    interface FailEntry {
+      index: number;
+      spec: NormalizedCommand;
+      result: ExecResult;
+      badgeLine: string;
+      header: string;
+      pass1Body: string;
+      pass1Block: string;
+    }
+    const passEntries: PassEntry[] = [];
+    const failEntries: FailEntry[] = [];
+    let notRunChars = 0;
+    let notRunBytes = 0;
+    let passChars = 0;
+    let passBytes = 0;
 
-  const bodyBudget = Math.max(0, maxChars - summaryHeader.length - 2);
-  const bodyByteBudget =
-    maxBytes !== undefined
-      ? Math.max(0, maxBytes - Buffer.byteLength(summaryHeader, "utf8") - 2)
-      : undefined;
+    for (let i = 0; i < outcomes.length; i++) {
+      const { spec, result, passed } = outcomes[i]!;
+      if (!result) {
+        const block = `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
+        blocks[i] = block;
+        notRunChars += block.length;
+        notRunBytes += Buffer.byteLength(block, "utf8");
+        continue;
+      }
+
+      if (passed) {
+        const body = formatCompactCommandOutput({
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          error: result.error,
+          maxChars: 300,
+        });
+        const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
+        const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
+        blocks[i] = fullBlock;
+        passChars += fullBlock.length;
+        passBytes += Buffer.byteLength(fullBlock, "utf8");
+        passEntries.push({ index: i, compactHeader, body, fullBlock });
+        continue;
+      }
+
+      const badge = result.error
+        ? "ERROR"
+        : result.timedOut
+          ? "TIMEOUT"
+          : `FAIL (exit ${result.exitCode ?? "err"})`;
+      const badgeLine = `## [${badge} ${result.durationMs}ms] ${spec.name}\n`;
+      const header = `${badgeLine}$ ${spec.command}\n`;
+
+      // Pass 1: fold & clean without premature per-command truncation to measure true folded size
+      const pass1Ceiling = Math.max(
+        bodyBudget,
+        result.stdout.length + result.stderr.length + 256,
+      );
+      const pass1Body = formatCompactCommandOutput({
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        error: result.error,
+        maxChars: pass1Ceiling,
+      });
+      failEntries.push({
+        index: i,
+        spec,
+        result,
+        badgeLine,
+        header,
+        pass1Body,
+        pass1Block: `${header}${pass1Body}`,
+      });
+    }
+
+    if (failEntries.length > 0) {
+      const totalSepChars = separator.length * Math.max(0, outcomes.length - 1);
+      const totalSepBytes =
+        Buffer.byteLength(separator, "utf8") * Math.max(0, outcomes.length - 1);
+      const availChars = Math.max(0, bodyBudget - totalSepChars);
+      const availBytes = Math.max(0, bodyByteBudget - totalSepBytes);
+      const availAfterNotRunChars = Math.max(0, availChars - notRunChars);
+      const availAfterNotRunBytes = Math.max(0, availBytes - notRunBytes);
+
+      const rawFailPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+      const rawFailPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+
+      // When verbose PASS summaries would starve FAIL output, shrink PASS summaries first
+      // so FAIL blocks keep at least their header + error body (up to 60% of available pool).
+      if (passEntries.length > 0) {
+        const minPassReserveChars = passEntries.reduce(
+          (sum, p) => sum + Math.min(p.fullBlock.length, p.compactHeader.length),
+          0,
+        );
+        const minPassReserveBytes = passEntries.reduce(
+          (sum, p) =>
+            sum +
+            Math.min(
+              Buffer.byteLength(p.fullBlock, "utf8"),
+              Buffer.byteLength(p.compactHeader, "utf8"),
+            ),
+          0,
+        );
+        const totalFailDemandChars = failEntries.reduce(
+          (sum, f) => sum + f.pass1Block.length,
+          0,
+        );
+        const totalFailDemandBytes = failEntries.reduce(
+          (sum, f) => sum + Buffer.byteLength(f.pass1Block, "utf8"),
+          0,
+        );
+        const failFloorChars = Math.max(
+          failEntries.reduce(
+            (sum, f) => sum + f.header.length + Math.min(f.pass1Body.length, 160),
+            0,
+          ),
+          Math.floor(availAfterNotRunChars * 0.6),
+        );
+        const failFloorBytes = Math.max(
+          failEntries.reduce(
+            (sum, f) =>
+              sum +
+              Buffer.byteLength(f.header, "utf8") +
+              Math.min(Buffer.byteLength(f.pass1Body, "utf8"), 160),
+            0,
+          ),
+          Math.floor(availAfterNotRunBytes * 0.6),
+        );
+        const desiredFailChars = Math.min(
+          totalFailDemandChars,
+          Math.max(0, availAfterNotRunChars - minPassReserveChars),
+          failFloorChars,
+        );
+        const desiredFailBytes = Math.min(
+          totalFailDemandBytes,
+          Math.max(0, availAfterNotRunBytes - minPassReserveBytes),
+          failFloorBytes,
+        );
+
+        if (rawFailPoolChars < desiredFailChars || rawFailPoolBytes < desiredFailBytes) {
+          const passPoolChars = Math.max(
+            0,
+            availAfterNotRunChars - Math.max(rawFailPoolChars, desiredFailChars),
+          );
+          const passPoolBytes = Math.max(
+            0,
+            availAfterNotRunBytes - Math.max(rawFailPoolBytes, desiredFailBytes),
+          );
+          const passCharShares = computeWaterFillBudgets(
+            passEntries.map((p) => p.fullBlock.length),
+            passPoolChars,
+          );
+          const passByteShares = computeWaterFillBudgets(
+            passEntries.map((p) => Buffer.byteLength(p.fullBlock, "utf8")),
+            passPoolBytes,
+          );
+
+          passChars = 0;
+          passBytes = 0;
+          for (let pIdx = 0; pIdx < passEntries.length; pIdx++) {
+            const p = passEntries[pIdx]!;
+            const shareChars = passCharShares[pIdx] ?? 0;
+            const shareBytes = passByteShares[pIdx] ?? 0;
+            let shrunk = p.fullBlock;
+            if (
+              shrunk.length > shareChars ||
+              Buffer.byteLength(shrunk, "utf8") > shareBytes
+            ) {
+              const noCmd = `${p.compactHeader}: ${p.body}`;
+              if (
+                noCmd.length <= shareChars &&
+                Buffer.byteLength(noCmd, "utf8") <= shareBytes
+              ) {
+                shrunk = noCmd;
+              } else {
+                const hdrBytes = Buffer.byteLength(p.compactHeader, "utf8");
+                const bodyCharsAvail = shareChars - p.compactHeader.length - 2;
+                const bodyBytesAvail = shareBytes - hdrBytes - 2;
+                if (bodyCharsAvail >= 8 && bodyBytesAvail >= 8) {
+                  const trimmedBody = sliceUtf8Bytes(
+                    sliceSafeChars(p.body, bodyCharsAvail - 3),
+                    bodyBytesAvail - 3,
+                  );
+                  shrunk = `${p.compactHeader}: ${trimmedBody}...`;
+                } else if (
+                  p.compactHeader.length <= shareChars &&
+                  hdrBytes <= shareBytes
+                ) {
+                  shrunk = p.compactHeader;
+                } else {
+                  shrunk = sliceUtf8Bytes(
+                    sliceSafeChars(p.compactHeader, shareChars),
+                    shareBytes,
+                  );
+                }
+              }
+            }
+            blocks[p.index] = shrunk;
+            passChars += shrunk.length;
+            passBytes += Buffer.byteLength(shrunk, "utf8");
+          }
+        }
+      }
+
+      // Strictly cap FAIL pools at available budget minus separators and fixed blocks
+      const failPoolChars = Math.max(0, availAfterNotRunChars - passChars);
+      const failPoolBytes = Math.max(0, availAfterNotRunBytes - passBytes);
+
+      // Pass 2: water-fill char and UTF-8 byte budgets across FAIL commands
+      const charBlockBudgets = computeWaterFillBudgets(
+        failEntries.map((entry) => entry.pass1Block.length),
+        failPoolChars,
+      );
+      const byteBlockBudgets = computeWaterFillBudgets(
+        failEntries.map((entry) => Buffer.byteLength(entry.pass1Block, "utf8")),
+        failPoolBytes,
+      );
+
+      for (let j = 0; j < failEntries.length; j++) {
+        const entry = failEntries[j]!;
+        const blockCharBudget = charBlockBudgets[j] ?? 0;
+        const blockByteBudget = byteBlockBudgets[j] ?? 0;
+        const pass1BodyBytes = Buffer.byteLength(entry.pass1Body, "utf8");
+        const fullHeaderBytes = Buffer.byteLength(entry.header, "utf8");
+
+        // Keep full header unless the command string itself would starve the error body
+        let effectiveHeader = entry.header;
+        if (
+          entry.header.length + Math.min(entry.pass1Body.length, 60) > blockCharBudget ||
+          fullHeaderBytes + Math.min(pass1BodyBytes, 60) > blockByteBudget
+        ) {
+          const badgeBytes = Buffer.byteLength(entry.badgeLine, "utf8");
+          const remChars = blockCharBudget - entry.badgeLine.length;
+          const remBytes = blockByteBudget - badgeBytes;
+          if (remChars >= 64 && remBytes >= 64) {
+            const cmdCap = Math.max(8, Math.floor(Math.min(remChars, remBytes) * 0.35) - 6);
+            const rawCmdBytes = Buffer.byteLength(entry.spec.command, "utf8");
+            const shortCmd =
+              entry.spec.command.length <= cmdCap && rawCmdBytes <= cmdCap
+                ? entry.spec.command
+                : `${sliceUtf8Bytes(sliceSafeChars(entry.spec.command, cmdCap), cmdCap)}...`;
+            effectiveHeader = `${entry.badgeLine}$ ${shortCmd}\n`;
+          } else {
+            effectiveHeader = entry.badgeLine;
+          }
+        }
+
+        const headerChars = effectiveHeader.length;
+        const headerBytes = Buffer.byteLength(effectiveHeader, "utf8");
+        const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
+        const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
+
+        if (
+          entry.pass1Body.length <= allowedBodyChars &&
+          pass1BodyBytes <= allowedBodyBytes
+        ) {
+          blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
+          continue;
+        }
+
+        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+        let targetChars = Math.min(
+          allowedBodyChars,
+          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar)),
+        );
+        let compactedBody =
+          targetChars > 0
+            ? formatCompactCommandOutput({
+                stdout: entry.result.stdout,
+                stderr: entry.result.stderr,
+                exitCode: entry.result.exitCode,
+                timedOut: entry.result.timedOut,
+                error: entry.result.error,
+                maxChars: targetChars,
+              })
+            : "";
+
+        // Converge char cap when multi-byte density in preserved head/tail exceeds average
+        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+          const curBytes = Buffer.byteLength(compactedBody, "utf8");
+          if (curBytes <= allowedBodyBytes) break;
+          targetChars = Math.max(
+            1,
+            Math.min(
+              targetChars - 1,
+              Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98),
+            ),
+          );
+          compactedBody = formatCompactCommandOutput({
+            stdout: entry.result.stdout,
+            stderr: entry.result.stderr,
+            exitCode: entry.result.exitCode,
+            timedOut: entry.result.timedOut,
+            error: entry.result.error,
+            maxChars: targetChars,
+          });
+        }
+
+        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+      }
+    }
+  }
+
   const fittedBlocks = fitSectionsToByteBudget(
     blocks,
     bodyBudget,
     bodyByteBudget,
-    "\n\n",
+    separator,
   );
   let text = truncateWithNotice(
-    `${summaryHeader}\n\n${fittedBlocks}`,
+    `${summaryHeader}${separator}${fittedBlocks}`,
     maxChars,
   );
-  if (maxBytes !== undefined) {
-    text = truncateWithByteNotice(text, maxBytes);
-  }
+  text = truncateWithByteNotice(text, maxBytes);
   return { text, isError: false };
 }
 
