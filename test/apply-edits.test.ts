@@ -4,15 +4,24 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { runApplyEdits } from "../src/tools/apply-edits.js";
+import { getSpillDir } from "../src/utils/spill.js";
 
 describe("apply_edits", () => {
   let tmpDir: string;
+  let suiteCacheDir: string;
+  let prevSuiteCacheDir: string | undefined;
 
   before(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-edits-"));
+    suiteCacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-edits-cache-"));
+    prevSuiteCacheDir = process.env.AGY_FAST_CACHE_DIR;
+    process.env.AGY_FAST_CACHE_DIR = suiteCacheDir;
   });
 
   after(async () => {
+    if (prevSuiteCacheDir === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+    else process.env.AGY_FAST_CACHE_DIR = prevSuiteCacheDir;
+    await fs.rm(suiteCacheDir, { recursive: true, force: true });
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -952,5 +961,131 @@ describe("apply_edits", () => {
     assert.doesNotMatch(res.text, /dist\/shared\.js/);
     assert.match(res.text, /src\/Table\.tsx\(42,11\): error TS2322/);
     assert.match(res.text, /Found 1 error in src\/Table\.tsx:42/);
+  });
+
+  it("spills full verify output lazily on >=20 folded lines or truncation/8.8KB byte cap and respects AGY_FAST_SPILL=off", async () => {
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-edits-spill-"));
+    const prevCache = process.env.AGY_FAST_CACHE_DIR;
+    const prevSpill = process.env.AGY_FAST_SPILL;
+    process.env.AGY_FAST_CACHE_DIR = cacheDir;
+    delete process.env.AGY_FAST_SPILL;
+
+    try {
+      const targetFile = path.join(tmpDir, "spill-verify-target.ts");
+      await fs.writeFile(targetFile, "export const v = 1;\n", "utf8");
+
+      // 1. Passing verify and short failing verify stay lazy (no spill file created)
+      const passRes = await runApplyEdits({
+        cwd: tmpDir,
+        edits: [{ path: "spill-verify-target.ts", hunks: [{ target: "v = 1", replacement: "v = 2" }] }],
+        verify: `${JSON.stringify(process.execPath)} -e "console.log('all 20 tests passed')"`,
+      });
+      assert.equal(passRes.isError, false);
+      assert.doesNotMatch(passRes.text, /\[full output spilled:/);
+      await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+
+      const shortFail = await runApplyEdits({
+        cwd: tmpDir,
+        edits: [{ path: "spill-verify-target.ts", hunks: [{ target: "v = 2", replacement: "v = 3" }] }],
+        verify: `${JSON.stringify(process.execPath)} -e "console.error('Error: tiny failure'); process.exit(1)"`,
+      });
+      assert.equal(shortFail.isError, false);
+      assert.doesNotMatch(shortFail.text, /\[full output spilled:/);
+      await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+
+      // 2. Verify failure folding >= 20 green build lines spills even when raw output fits in maxVerifyChars
+      const foldScript = path.join(tmpDir, "mock-fold-spill-verify.mjs");
+      await fs.writeFile(
+        foldScript,
+        [
+          "console.log('> @demo/app@1.0.0 build');",
+          "console.log('vite v5.4.1 building for production...');",
+          "for (let i = 0; i < 24; i++) console.log('dist/chunk-' + i + '.js   10.20 kB │ gzip: 3.10 kB');",
+          "console.log('✓ built in 1.25s');",
+          "console.error('Authorization: Bearer super_secret_verify_token_1234567890');",
+          "for (let i = 0; i < 15; i++) console.error('src/mod.ts(' + (i + 1) + ',1): error TS2322: FOLD_VERIFY_ERR_' + i);",
+          "process.exit(1);",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const foldRes = await runApplyEdits({
+        cwd: tmpDir,
+        maxVerifyChars: 4000,
+        edits: [{ path: "spill-verify-target.ts", hunks: [{ target: "v = 3", replacement: "v = 4" }] }],
+        verify: `${JSON.stringify(process.execPath)} ${JSON.stringify(foldScript)}`,
+      });
+      assert.equal(foldRes.isError, false);
+      assert.ok(Buffer.byteLength(foldRes.text, "utf8") <= 8_800);
+      assert.match(foldRes.text, /\.\.\. \(collapsed \d+ build\/pass lines/);
+      const foldMatch = foldRes.text.match(
+        /\[full output spilled: (.+?) \((\d+) lines\) — read_file ranges: verify L(\d+)-L(\d+)\]/,
+      );
+      assert.ok(foldMatch, `Expected spill footer with verify range, got:\n${foldRes.text}`);
+      const foldSpillPath = foldMatch[1]!;
+      const foldLines = (await fs.readFile(foldSpillPath, "utf8")).split("\n");
+      assert.equal(foldLines.length, Number(foldMatch[2]));
+      const sliced = foldLines.slice(Number(foldMatch[3]) - 1, Number(foldMatch[4]));
+      assert.equal(sliced[0], "=== verify ===");
+      assert.ok(sliced.some((l) => l.includes("dist/chunk-0.js")));
+      assert.ok(sliced.some((l) => l.includes("dist/chunk-23.js")));
+      assert.ok(sliced.some((l) => l.includes("Authorization: Bearer [REDACTED]")));
+      assert.equal(sliced.some((l) => l.includes("super_secret_verify_token_1234567890")), false);
+
+      // 3. Large CJK verify output stays strictly <= 8,800 UTF-8 bytes with footer and zero lone surrogates
+      const cjkScript = path.join(tmpDir, "mock-cjk-spill-verify.mjs");
+      await fs.writeFile(
+        cjkScript,
+        [
+          "console.error('Error: 中文根因验证失败_CJK_VERIFY_HEAD');",
+          "for (let i = 0; i < 240; i++) console.error('Error: 中文验证详情_' + i + '_🚀_类型定义与实际返回不匹配需要修正接口字段');",
+          "console.error('Error: 中文尾部验证失败_CJK_VERIFY_TAIL');",
+          "process.exit(1);",
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const cjkRes = await runApplyEdits({
+        cwd: tmpDir,
+        maxVerifyChars: 7500,
+        edits: [{ path: "spill-verify-target.ts", hunks: [{ target: "v = 4", replacement: "v = 5" }] }],
+        verify: `${JSON.stringify(process.execPath)} ${JSON.stringify(cjkScript)}`,
+      });
+      assert.equal(cjkRes.isError, false);
+      const cjkBytes = Buffer.byteLength(cjkRes.text, "utf8");
+      assert.ok(cjkBytes <= 8_800, `Expected <= 8800 UTF-8 bytes, got ${cjkBytes}`);
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cjkRes.text),
+        false,
+      );
+      assert.match(cjkRes.text, /中文根因验证失败_CJK_VERIFY_HEAD/);
+      assert.match(cjkRes.text, /中文尾部验证失败_CJK_VERIFY_TAIL/);
+      assert.match(cjkRes.text, /\[full output spilled: .+? — read_file ranges: verify L1-L\d+\]/);
+
+      // 4. AGY_FAST_SPILL=off suppresses spilling completely
+      const offCache = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-edits-spill-off-"));
+      try {
+        process.env.AGY_FAST_CACHE_DIR = offCache;
+        process.env.AGY_FAST_SPILL = "off";
+        const offRes = await runApplyEdits({
+          cwd: tmpDir,
+          maxVerifyChars: 4000,
+          edits: [{ path: "spill-verify-target.ts", hunks: [{ target: "v = 5", replacement: "v = 6" }] }],
+          verify: `${JSON.stringify(process.execPath)} ${JSON.stringify(cjkScript)}`,
+        });
+        assert.equal(offRes.isError, false);
+        assert.ok(Buffer.byteLength(offRes.text, "utf8") <= 8_800);
+        assert.doesNotMatch(offRes.text, /\[full output spilled:/);
+        await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+      } finally {
+        await fs.rm(offCache, { recursive: true, force: true });
+      }
+    } finally {
+      if (prevCache === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+      else process.env.AGY_FAST_CACHE_DIR = prevCache;
+      if (prevSpill === undefined) delete process.env.AGY_FAST_SPILL;
+      else process.env.AGY_FAST_SPILL = prevSpill;
+      await fs.rm(cacheDir, { recursive: true, force: true });
+    }
   });
 });

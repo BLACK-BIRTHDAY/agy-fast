@@ -10,10 +10,12 @@ import { MCP_CALL_BUDGET_SEC, runShellCommandAsync } from "../utils/exec-utils.j
 import { readTextFile, resolvePath, toPosixPath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
-  formatCompactCommandOutput,
+  formatCompactCommandOutputWithMeta,
+  normalizeTerminalOutput,
   sliceSafeChars,
   truncateWithByteNotice,
 } from "../utils/output-filter.js";
+import { formatSpillFooter, writeSpillFile } from "../utils/spill.js";
 
 export interface EditHunk {
   target: string;
@@ -971,7 +973,7 @@ export async function runApplyEdits(
       : res.exitCode === 0
         ? "PASS"
         : `FAIL (exit ${res.exitCode ?? "err"})`;
-    const formatted = formatCompactCommandOutput({
+    const verifyMeta = formatCompactCommandOutputWithMeta({
       stdout: res.stdout,
       stderr: res.stderr,
       exitCode: res.exitCode,
@@ -980,9 +982,108 @@ export async function runApplyEdits(
       maxChars: maxVerifyChars,
     });
 
-    parts.push(
-      `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n${formatted}`,
-    );
+    const verifyPrefix = `\nVerify [${status} in ${res.durationMs}ms] \`${verifySpec.command}\`:\n`;
+    const baseText = `${parts[0]!}\n${verifyPrefix}`;
+    const candidateOutText = `${baseText}${verifyMeta.text}`;
+    const candidateBytes = Buffer.byteLength(candidateOutText, "utf8");
+    const verifyFailed = Boolean(res.error || res.timedOut || res.exitCode !== 0);
+    const shouldSpill =
+      (verifyFailed &&
+        (verifyMeta.truncated ||
+          verifyMeta.collapsedLines >= 20 ||
+          verifyMeta.rawChars > maxVerifyChars)) ||
+      candidateBytes > DEFAULT_INLINE_MAX_BYTES;
+
+    if (shouldSpill) {
+      const footerCapChars = Math.min(480, Math.max(0, maxVerifyChars - 120));
+      const footerCapBytes = Math.min(900, Math.max(0, DEFAULT_INLINE_MAX_BYTES - 240));
+      if (footerCapChars >= 48 && footerCapBytes >= 48) {
+        const rawNormalized = [
+          normalizeTerminalOutput(res.stdout),
+          normalizeTerminalOutput(res.stderr),
+        ]
+          .filter(Boolean)
+          .join("\n");
+        const spillContent = res.error
+          ? `spawn error: ${res.error}`
+          : rawNormalized || "(no output)";
+        const spillResult = await writeSpillFile({
+          tool: "apply_edits",
+          sections: [
+            {
+              label: "verify",
+              content: spillContent,
+              truncated: true,
+            },
+          ],
+        });
+        if (spillResult) {
+          const footer = formatSpillFooter(spillResult, {
+            maxChars: footerCapChars,
+            maxBytes: footerCapBytes,
+          });
+          if (!footer) {
+            await fs.unlink(spillResult.filePath).catch(() => {});
+          } else {
+            const footerBytes = Buffer.byteLength(footer, "utf8");
+            const maxPrefixBytes = Math.max(0, DEFAULT_INLINE_MAX_BYTES - footerBytes);
+            const baseBytes = Buffer.byteLength(baseText, "utf8");
+            const availVerifyBytes = Math.max(0, maxPrefixBytes - baseBytes);
+            const reducedVerifyChars = Math.max(120, maxVerifyChars - footer.length);
+
+            let verifyBody = verifyMeta.text;
+            const curBodyBytes = Buffer.byteLength(verifyBody, "utf8");
+            if (verifyBody.length > reducedVerifyChars || curBodyBytes > availVerifyBytes) {
+              if (availVerifyBytes <= 0) {
+                verifyBody = "";
+              } else {
+                const bytesPerChar = curBodyBytes / Math.max(1, verifyBody.length);
+                let targetChars = Math.min(
+                  reducedVerifyChars,
+                  Math.max(1, Math.floor(availVerifyBytes / Math.max(1, bytesPerChar))),
+                );
+                verifyBody = formatCompactCommandOutputWithMeta({
+                  stdout: res.stdout,
+                  stderr: res.stderr,
+                  exitCode: res.exitCode,
+                  timedOut: res.timedOut,
+                  error: res.error,
+                  maxChars: targetChars,
+                }).text;
+
+                for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+                  const bodyBytes = Buffer.byteLength(verifyBody, "utf8");
+                  if (bodyBytes <= availVerifyBytes) break;
+                  targetChars = Math.max(
+                    1,
+                    Math.min(
+                      targetChars - 1,
+                      Math.floor(targetChars * (availVerifyBytes / bodyBytes) * 0.98),
+                    ),
+                  );
+                  verifyBody = formatCompactCommandOutputWithMeta({
+                    stdout: res.stdout,
+                    stderr: res.stderr,
+                    exitCode: res.exitCode,
+                    timedOut: res.timedOut,
+                    error: res.error,
+                    maxChars: targetChars,
+                  }).text;
+                }
+              }
+            }
+
+            const prefix = truncateWithByteNotice(
+              `${baseText}${verifyBody}`,
+              maxPrefixBytes,
+            );
+            return { text: `${prefix}${footer}`, isError: false };
+          }
+        }
+      }
+    }
+
+    parts.push(`${verifyPrefix}${verifyMeta.text}`);
   }
 
   const outText = parts.join("\n");

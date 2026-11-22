@@ -9,9 +9,12 @@ import {
   tokenizeArgs,
   validateReadonlyGitArgs,
 } from "../src/tools/batch-search.js";
+import { getSpillDir } from "../src/utils/spill.js";
 
 describe("batch_search", () => {
   let tmpDir: string;
+  let suiteCacheDir: string;
+  let prevSuiteCacheDir: string | undefined;
 
   for (const forceNodeFallback of [false, true]) {
     it(`supports file-only output, line counts and language filtering (forceNodeFallback=${forceNodeFallback})`, async () => {
@@ -157,6 +160,9 @@ describe("batch_search", () => {
 
   before(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-"));
+    suiteCacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-cache-"));
+    prevSuiteCacheDir = process.env.AGY_FAST_CACHE_DIR;
+    process.env.AGY_FAST_CACHE_DIR = suiteCacheDir;
     await fs.mkdir(path.join(tmpDir, "src", "api"), { recursive: true });
     await fs.mkdir(path.join(tmpDir, "node_modules", "ignored-pkg"), {
       recursive: true,
@@ -234,6 +240,9 @@ describe("batch_search", () => {
   });
 
   after(async () => {
+    if (prevSuiteCacheDir === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+    else process.env.AGY_FAST_CACHE_DIR = prevSuiteCacheDir;
+    await fs.rm(suiteCacheDir, { recursive: true, force: true });
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -950,6 +959,118 @@ describe("batch_search", () => {
       }
     } finally {
       await fs.rm(edgeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("spills full post-maxResults search output lazily on char/8.8KB byte truncation and respects AGY_FAST_SPILL=off", async () => {
+    const spillCwd = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-spill-cwd-"));
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-spill-cache-"));
+    const prevCache = process.env.AGY_FAST_CACHE_DIR;
+    const prevSpill = process.env.AGY_FAST_SPILL;
+    process.env.AGY_FAST_CACHE_DIR = cacheDir;
+    delete process.env.AGY_FAST_SPILL;
+
+    try {
+      const manyLines = Array.from(
+        { length: 90 },
+        (_, i) =>
+          i === 0
+            ? `HIT_LINE_00 sk-ant-api03_secret_key_value_1234567890`
+            : `HIT_LINE_${String(i).padStart(2, "0")} padding_${"a".repeat(40)}`,
+      );
+      await fs.writeFile(path.join(spillCwd, "hits.txt"), manyLines.join("\n") + "\n", "utf8");
+      await fs.writeFile(path.join(spillCwd, "small.txt"), "SMALL_MARKER_ONLY\n", "utf8");
+      const cjkLines = Array.from(
+        { length: 120 },
+        (_, i) => `第${i + 1}行：中文搜索命中_CJK_SPILL_🚀_${"测试数据内容".repeat(10)}`,
+      );
+      await fs.writeFile(path.join(spillCwd, "cjk.txt"), cjkLines.join("\n") + "\n", "utf8");
+
+      // 1. Fits inline (even when maxResults caps hits to 5) -> lazy, zero spill files created
+      const inlineRes = await runBatchSearch({
+        cwd: spillCwd,
+        queries: [
+          { type: "text", pattern: "HIT_LINE_", path: "hits.txt", maxResults: 5 },
+          { type: "text", pattern: "SMALL_MARKER", path: "small.txt" },
+        ],
+      });
+      assert.equal(inlineRes.isError, false);
+      assert.match(inlineRes.text, /truncated at 5 matches/);
+      assert.doesNotMatch(inlineRes.text, /\[full output spilled:/);
+      await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+
+      // 2. Exceeds maxChars -> spills all sections, highlights truncated Query 1 with exact Lstart-Lend + redaction
+      const truncRes = await runBatchSearch({
+        cwd: spillCwd,
+        maxChars: 1200,
+        queries: [
+          { type: "text", pattern: "HIT_LINE_", path: "hits.txt", maxResults: 90 },
+          { type: "text", pattern: "SMALL_MARKER", path: "small.txt" },
+        ],
+      });
+      assert.equal(truncRes.isError, false);
+      assert.ok(truncRes.text.length <= 1200, `Exceeded maxChars: ${truncRes.text.length}`);
+      assert.ok(Buffer.byteLength(truncRes.text, "utf8") <= 8_800);
+      assert.match(truncRes.text, /SMALL_MARKER_ONLY/);
+
+      const match = truncRes.text.match(
+        /\[full output spilled: (.+?) \((\d+) lines\) — read_file ranges: Query 1 L(\d+)-L(\d+)\]/,
+      );
+      assert.ok(match, `Expected spill footer highlighting Query 1, got:\n${truncRes.text}`);
+      const spillLines = (await fs.readFile(match[1]!, "utf8")).split("\n");
+      assert.equal(spillLines.length, Number(match[2]));
+      const q1Slice = spillLines.slice(Number(match[3]) - 1, Number(match[4]));
+      assert.equal(q1Slice[0], "=== Query 1 ===");
+      assert.ok(q1Slice.some((l) => l.includes("HIT_LINE_00 [REDACTED]")));
+      assert.ok(q1Slice.some((l) => l.includes("HIT_LINE_89")));
+      assert.equal(spillLines.some((l) => l.includes("sk-ant-api03_secret_key")), false);
+      assert.ok(spillLines.includes("=== Query 2 ==="));
+
+      // 3. Heavy CJK output exceeding 8,800 UTF-8 bytes -> spills and stays strictly <= 8,800 bytes with zero lone surrogates
+      const cjkRes = await runBatchSearch({
+        cwd: spillCwd,
+        maxChars: 8500,
+        queries: [
+          { type: "text", pattern: "CJK_SPILL", path: "cjk.txt", maxResults: 120 },
+          { type: "text", pattern: "SMALL_MARKER", path: "small.txt" },
+        ],
+      });
+      assert.equal(cjkRes.isError, false);
+      assert.ok(cjkRes.text.length <= 8500);
+      const cjkBytes = Buffer.byteLength(cjkRes.text, "utf8");
+      assert.ok(cjkBytes <= 8_800, `Expected <= 8800 UTF-8 bytes, got ${cjkBytes}`);
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cjkRes.text),
+        false,
+      );
+      assert.match(cjkRes.text, /\[full output spilled: .+? — read_file ranges: Query 1 L1-L\d+\]/);
+
+      // 4. AGY_FAST_SPILL=off suppresses spilling completely
+      const offCache = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-search-spill-off-"));
+      try {
+        process.env.AGY_FAST_CACHE_DIR = offCache;
+        process.env.AGY_FAST_SPILL = "off";
+        const offRes = await runBatchSearch({
+          cwd: spillCwd,
+          maxChars: 1200,
+          queries: [
+            { type: "text", pattern: "HIT_LINE_", path: "hits.txt", maxResults: 90 },
+          ],
+        });
+        assert.equal(offRes.isError, false);
+        assert.ok(offRes.text.length <= 1200);
+        assert.doesNotMatch(offRes.text, /\[full output spilled:/);
+        await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+      } finally {
+        await fs.rm(offCache, { recursive: true, force: true });
+      }
+    } finally {
+      if (prevCache === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+      else process.env.AGY_FAST_CACHE_DIR = prevCache;
+      if (prevSpill === undefined) delete process.env.AGY_FAST_SPILL;
+      else process.env.AGY_FAST_SPILL = prevSpill;
+      await fs.rm(cacheDir, { recursive: true, force: true });
+      await fs.rm(spillCwd, { recursive: true, force: true });
     }
   });
 });

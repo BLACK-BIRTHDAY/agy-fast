@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import { runChecks } from "../src/tools/run-checks.js";
+import { getSpillDir } from "../src/utils/spill.js";
 import {
   buildPowerShellUtf8Command,
   decodeProcessOutput,
@@ -16,6 +18,20 @@ import {
 
 describe("run_checks", () => {
   const nodeBin = JSON.stringify(process.execPath);
+  let suiteCacheDir: string;
+  let prevSuiteCacheDir: string | undefined;
+
+  before(async () => {
+    suiteCacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-checks-cache-"));
+    prevSuiteCacheDir = process.env.AGY_FAST_CACHE_DIR;
+    process.env.AGY_FAST_CACHE_DIR = suiteCacheDir;
+  });
+
+  after(async () => {
+    if (prevSuiteCacheDir === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+    else process.env.AGY_FAST_CACHE_DIR = prevSuiteCacheDir;
+    await fs.rm(suiteCacheDir, { recursive: true, force: true });
+  });
 
   it("executes multiple commands concurrently and compacts passing output", async () => {
     const start = Date.now();
@@ -578,4 +594,158 @@ describe("run_checks", () => {
       }
     });
   }
+
+  it("spills full output lazily on truncation or >=20 folded lines, stays within budgets, and honors AGY_FAST_SPILL=off", async () => {
+    const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-checks-spill-"));
+    const prevCache = process.env.AGY_FAST_CACHE_DIR;
+    const prevSpill = process.env.AGY_FAST_SPILL;
+    process.env.AGY_FAST_CACHE_DIR = cacheDir;
+    delete process.env.AGY_FAST_SPILL;
+
+    try {
+      // 1. Small inline output (including noise-filtered warning & <20 folded green lines) -> lazy, zero spill files created
+      const smallFoldScript = [
+        "console.log('> @app/pkg@1.0.0 build');",
+        "console.log('vite v5.4.1 building for production...');",
+        "console.log('transforming...');",
+        "console.log('✓ 12 modules transformed.');",
+        "console.log('rendering chunks...');",
+        "console.log('✓ built in 0.42s');",
+        "for (let i = 0; i < 15; i++) console.error('src/small.ts(' + (i + 1) + ',1): error TS2322: SMALL_FOLD_ERR_' + i);",
+        "process.exit(1);",
+      ].join(" ");
+      const inlineRes = await runChecks({
+        outputMode: "compact",
+        commands: [
+          { name: "ok-1", command: `${nodeBin} -e "console.log('10 tests passed')"` },
+          {
+            name: "warn-fail",
+            command: `${nodeBin} -e "console.error('(node:1234) ExperimentalWarning: foo\\nError: minor'); process.exit(1)"`,
+          },
+          {
+            name: "small-fold-fail",
+            command: `${nodeBin} -e ${JSON.stringify(smallFoldScript)}`,
+          },
+        ],
+      });
+      assert.equal(inlineRes.isError, false);
+      assert.match(inlineRes.text, /\.\.\. \(collapsed [4-9] build\/pass lines/);
+      assert.doesNotMatch(inlineRes.text, /\[full output spilled:/);
+      await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+
+      // 2. Full mode truncation -> unified spill file with exact readable ranges + redaction
+      const fullRes = await runChecks({
+        outputMode: "full",
+        maxChars: 1400,
+        commands: [
+          { name: "tiny-ok", command: `${nodeBin} -e "console.log('TINY_OK_LINE')"` },
+          {
+            name: "verbose-cmd",
+            command: `${nodeBin} -e "console.log('ghp_' + 'a1B2'.repeat(9)); for (let i = 0; i < 80; i++) console.log('FULL_LINE_' + i + '_' + 'x'.repeat(25));"`,
+          },
+        ],
+      });
+      assert.equal(fullRes.isError, false);
+      assert.ok(fullRes.text.length <= 1400, `Exceeded maxChars: ${fullRes.text.length}`);
+      assert.ok(Buffer.byteLength(fullRes.text, "utf8") <= 8_800);
+
+      const fullMatch = fullRes.text.match(
+        /\[full output spilled: (.+?) \((\d+) lines\) — read_file ranges: verbose-cmd L(\d+)-L(\d+)\]/,
+      );
+      assert.ok(fullMatch, `Expected spill footer prioritizing verbose-cmd, got:\n${fullRes.text}`);
+      const fullSpillLines = (await fs.readFile(fullMatch[1]!, "utf8")).split("\n");
+      assert.equal(fullSpillLines.length, Number(fullMatch[2]));
+      const verboseSlice = fullSpillLines.slice(Number(fullMatch[3]) - 1, Number(fullMatch[4]));
+      assert.equal(verboseSlice[0], "=== verbose-cmd ===");
+      assert.equal(verboseSlice[1], "[REDACTED]");
+      assert.ok(verboseSlice.some((l) => l.startsWith("FULL_LINE_0_")));
+      assert.ok(verboseSlice.some((l) => l.startsWith("FULL_LINE_79_")));
+      assert.equal(fullSpillLines.some((l) => l.includes("ghp_a1B2")), false);
+      // Both commands are in the unified spill file
+      assert.equal(fullSpillLines[0], "=== tiny-ok ===");
+      assert.equal(fullSpillLines[1], "TINY_OK_LINE");
+
+      // 3. Compact mode failure folding >= 20 green lines triggers spill even when raw output fits under maxChars
+      const foldScript = [
+        "console.log('> @app/pkg@1.0.0 build');",
+        "console.log('vite v5.4.1 building for production...');",
+        "for (let i = 0; i < 24; i++) console.log('dist/chunk-' + i + '.js   11.20 kB │ gzip: 3.40 kB');",
+        "console.log('✓ built in 1.05s');",
+        "for (let i = 0; i < 15; i++) console.error('src/a.ts(' + (i + 1) + ',1): error TS2322: COMPACT_FOLD_ERR_' + i);",
+        "process.exit(1);",
+      ].join(" ");
+      const foldRes = await runChecks({
+        outputMode: "compact",
+        maxChars: 6000,
+        commands: [
+          { name: "lint", command: `${nodeBin} -e "console.log('0 errors')"` },
+          { name: "build-fold", command: `${nodeBin} -e ${JSON.stringify(foldScript)}` },
+        ],
+      });
+      assert.equal(foldRes.isError, false);
+      assert.ok(foldRes.text.length <= 6000);
+      assert.ok(Buffer.byteLength(foldRes.text, "utf8") <= 8_800);
+      assert.match(foldRes.text, /\.\.\. \(collapsed \d+ build\/pass lines/);
+      const foldMatch = foldRes.text.match(
+        /\[full output spilled: (.+?) \((\d+) lines\) — read_file ranges: build-fold L(\d+)-L(\d+)\]/,
+      );
+      assert.ok(foldMatch, `Expected spill footer for >=20 folded lines, got:\n${foldRes.text}`);
+      const foldLines = (await fs.readFile(foldMatch[1]!, "utf8")).split("\n");
+      const buildSlice = foldLines.slice(Number(foldMatch[3]) - 1, Number(foldMatch[4]));
+      assert.equal(buildSlice[0], "=== build-fold ===");
+      assert.ok(buildSlice.some((l) => l.includes("dist/chunk-0.js")));
+      assert.ok(buildSlice.some((l) => l.includes("dist/chunk-23.js")));
+      assert.ok(buildSlice.some((l) => l.includes("COMPACT_FOLD_ERR_14")));
+
+      // 4. CJK compact truncation stays strictly <= 8,800 UTF-8 bytes with footer and zero lone surrogates
+      const cjkScript = [
+        "console.error('Error: 中文根因错误_SPILL_HEAD');",
+        "for (let i = 0; i < 230; i++) console.error('Error: 中文详情_' + i + '_🚀_编译报错信息内容用于验证字节上限');",
+        "console.error('Error: 中文尾部错误_SPILL_TAIL');",
+        "process.exit(1);",
+      ].join(" ");
+      const cjkRes = await runChecks({
+        outputMode: "compact",
+        maxChars: 8000,
+        commands: [{ name: "cjk-check", command: `${nodeBin} -e ${JSON.stringify(cjkScript)}` }],
+      });
+      assert.equal(cjkRes.isError, false);
+      assert.ok(cjkRes.text.length <= 8000);
+      assert.ok(Buffer.byteLength(cjkRes.text, "utf8") <= 8_800);
+      assert.equal(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(cjkRes.text),
+        false,
+      );
+      assert.match(cjkRes.text, /\[full output spilled: .+? — read_file ranges: cjk-check L1-L\d+\]/);
+
+      // 5. AGY_FAST_SPILL=off suppresses spilling completely
+      const offCache = await fs.mkdtemp(path.join(os.tmpdir(), "agy-fast-checks-spill-off-"));
+      try {
+        process.env.AGY_FAST_CACHE_DIR = offCache;
+        process.env.AGY_FAST_SPILL = "off";
+        const offRes = await runChecks({
+          outputMode: "full",
+          maxChars: 1200,
+          commands: [
+            {
+              name: "big",
+              command: `${nodeBin} -e "for (let i = 0; i < 80; i++) console.log('LINE_' + i + '_' + 'y'.repeat(30));"`,
+            },
+          ],
+        });
+        assert.equal(offRes.isError, false);
+        assert.ok(offRes.text.length <= 1200);
+        assert.doesNotMatch(offRes.text, /\[full output spilled:/);
+        await assert.rejects(() => fs.lstat(getSpillDir()), { code: "ENOENT" });
+      } finally {
+        await fs.rm(offCache, { recursive: true, force: true });
+      }
+    } finally {
+      if (prevCache === undefined) delete process.env.AGY_FAST_CACHE_DIR;
+      else process.env.AGY_FAST_CACHE_DIR = prevCache;
+      if (prevSpill === undefined) delete process.env.AGY_FAST_SPILL;
+      else process.env.AGY_FAST_SPILL = prevSpill;
+      await fs.rm(cacheDir, { recursive: true, force: true });
+    }
+  });
 });

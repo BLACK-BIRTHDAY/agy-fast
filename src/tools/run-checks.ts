@@ -11,14 +11,21 @@ import { resolvePath } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
   computeWaterFillBudgets,
+  fitSectionsToBudget,
   fitSectionsToByteBudget,
-  formatCompactCommandOutput,
+  formatCompactCommandOutputWithMeta,
   normalizeTerminalOutput,
   sliceSafeChars,
   sliceUtf8Bytes,
   truncateWithByteNotice,
   truncateWithNotice,
+  type CompactCommandOutputMeta,
 } from "../utils/output-filter.js";
+import {
+  formatSpillFooter,
+  writeSpillFile,
+  type SpillSectionInput,
+} from "../utils/spill.js";
 
 export interface CheckCommandSpec {
   name?: string;
@@ -250,7 +257,150 @@ export async function runChecks(
     maxBytes - Buffer.byteLength(summaryHeader, "utf8") - Buffer.byteLength(separator, "utf8"),
   );
 
+  const firstPass = renderRunChecksBody(
+    outcomes,
+    outputMode,
+    bodyBudget,
+    bodyByteBudget,
+    separator,
+  );
+
+  if (firstPass.spillTriggered) {
+    const minBodyChars = Math.max(200, outcomes.length * 52);
+    const minBodyBytes = minBodyChars;
+    const footerCapChars = Math.min(480, bodyBudget - minBodyChars);
+    const footerCapBytes = Math.min(900, bodyByteBudget - minBodyBytes);
+
+    if (footerCapChars >= 48 && footerCapBytes >= 48) {
+      const spillSections: SpillSectionInput[] = [];
+      for (let i = 0; i < outcomes.length; i++) {
+        const outcome = outcomes[i]!;
+        if (!outcome.result) continue;
+        spillSections.push({
+          label: outcome.spec.name,
+          content: buildNormalizedCommandOutput(outcome.result),
+          truncated: firstPass.truncatedOutcomeIndices.has(i),
+        });
+      }
+
+      if (spillSections.length > 0) {
+        const spillResult = await writeSpillFile({
+          tool: "run_checks",
+          sections: spillSections,
+        });
+        if (spillResult) {
+          const footer = formatSpillFooter(spillResult, {
+            maxChars: footerCapChars,
+            maxBytes: footerCapBytes,
+          });
+          if (!footer) {
+            await fs.unlink(spillResult.filePath).catch(() => {});
+          } else {
+            const footerBytes = Buffer.byteLength(footer, "utf8");
+            const reducedBodyBudget = Math.max(0, bodyBudget - footer.length);
+            const reducedBodyByteBudget = Math.max(0, bodyByteBudget - footerBytes);
+            const secondPass = renderRunChecksBody(
+              outcomes,
+              outputMode,
+              reducedBodyBudget,
+              reducedBodyByteBudget,
+              separator,
+            );
+            const maxPrefixChars = Math.max(0, maxChars - footer.length);
+            const maxPrefixBytes = Math.max(0, maxBytes - footerBytes);
+            let prefix = truncateWithNotice(
+              `${summaryHeader}${separator}${secondPass.fittedBody}`,
+              maxPrefixChars,
+            );
+            prefix = truncateWithByteNotice(prefix, maxPrefixBytes);
+            return { text: `${prefix}${footer}`, isError: false };
+          }
+        }
+      }
+    }
+  }
+
+  let text = truncateWithNotice(
+    `${summaryHeader}${separator}${firstPass.fittedBody}`,
+    maxChars,
+  );
+  text = truncateWithByteNotice(text, maxBytes);
+  return { text, isError: false };
+}
+
+function buildNormalizedCommandOutput(result: ExecResult): string {
+  const combined = [
+    normalizeTerminalOutput(result.stdout),
+    normalizeTerminalOutput(result.stderr),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+}
+
+function detectFittedTruncation(
+  blocks: string[],
+  bodyBudget: number,
+  bodyByteBudget: number,
+  separator: string,
+): Set<number> {
+  const truncated = new Set<number>();
+  if (blocks.length === 0) return truncated;
+  const joined = blocks.join(separator);
+  const sepChars = separator.length * (blocks.length - 1);
+  const sepBytes = Buffer.byteLength(separator, "utf8") * (blocks.length - 1);
+
+  if (joined.length > bodyBudget) {
+    if (sepChars >= bodyBudget) {
+      for (let i = 0; i < blocks.length; i++) truncated.add(i);
+    } else {
+      const charBudgets = computeWaterFillBudgets(
+        blocks.map((b) => b.length),
+        bodyBudget - sepChars,
+      );
+      for (let i = 0; i < blocks.length; i++) {
+        if (blocks[i]!.length > (charBudgets[i] ?? 0)) {
+          truncated.add(i);
+        }
+      }
+    }
+  }
+
+  const charFitted = fitSectionsToBudget(blocks, bodyBudget, separator);
+  if (Buffer.byteLength(charFitted, "utf8") > bodyByteBudget) {
+    if (sepBytes >= bodyByteBudget) {
+      for (let i = 0; i < blocks.length; i++) truncated.add(i);
+    } else {
+      const byteBudgets = computeWaterFillBudgets(
+        blocks.map((b) => Buffer.byteLength(b, "utf8")),
+        bodyByteBudget - sepBytes,
+      );
+      for (let i = 0; i < blocks.length; i++) {
+        if (Buffer.byteLength(blocks[i]!, "utf8") > (byteBudgets[i] ?? 0)) {
+          truncated.add(i);
+        }
+      }
+    }
+  }
+
+  return truncated;
+}
+
+function renderRunChecksBody(
+  outcomes: CheckRunOutcome[],
+  outputMode: "compact" | "full",
+  bodyBudget: number,
+  bodyByteBudget: number,
+  separator: string,
+): {
+  fittedBody: string;
+  spillTriggered: boolean;
+  truncatedOutcomeIndices: Set<number>;
+} {
+  const truncatedOutcomeIndices = new Set<number>();
+  let spillTriggered = false;
   let blocks: string[];
+
   if (outputMode === "full") {
     blocks = outcomes.map(({ spec, result, passed }) => {
       if (!result) return `## [NOT RUN] ${spec.name}\n$ ${spec.command}`;
@@ -261,13 +411,7 @@ export async function runChecks(
           : passed
             ? "PASS"
             : `FAIL (exit ${result.exitCode ?? "err"})`;
-      const combined = [
-        normalizeTerminalOutput(result.stdout),
-        normalizeTerminalOutput(result.stderr),
-      ]
-        .filter(Boolean)
-        .join("\n");
-      const body = result.error ? `spawn error: ${result.error}` : combined || "(no output)";
+      const body = buildNormalizedCommandOutput(result);
       return `## [${badge}] ${spec.name} (${result.durationMs}ms)\n$ ${spec.command}\n${body}`;
     });
   } else {
@@ -287,6 +431,7 @@ export async function runChecks(
       result: ExecResult;
       badgeLine: string;
       header: string;
+      pass1Meta: CompactCommandOutputMeta;
       pass1Body: string;
       pass1Block: string;
     }
@@ -308,14 +453,14 @@ export async function runChecks(
       }
 
       if (passed) {
-        const body = formatCompactCommandOutput({
+        const body = formatCompactCommandOutputWithMeta({
           stdout: result.stdout,
           stderr: result.stderr,
           exitCode: result.exitCode,
           timedOut: result.timedOut,
           error: result.error,
           maxChars: 300,
-        });
+        }).text;
         const compactHeader = `- [PASS ${result.durationMs}ms] ${spec.name}`;
         const fullBlock = `${compactHeader} (\`${spec.command}\`): ${body}`;
         blocks[i] = fullBlock;
@@ -338,7 +483,7 @@ export async function runChecks(
         bodyBudget,
         result.stdout.length + result.stderr.length + 256,
       );
-      const pass1Body = formatCompactCommandOutput({
+      const pass1Meta = formatCompactCommandOutputWithMeta({
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode,
@@ -352,8 +497,9 @@ export async function runChecks(
         result,
         badgeLine,
         header,
-        pass1Body,
-        pass1Block: `${header}${pass1Body}`,
+        pass1Meta,
+        pass1Body: pass1Meta.text,
+        pass1Block: `${header}${pass1Meta.text}`,
       });
     }
 
@@ -477,6 +623,8 @@ export async function runChecks(
                     shareBytes,
                   );
                 }
+                truncatedOutcomeIndices.add(p.index);
+                spillTriggered = true;
               }
             }
             blocks[p.index] = shrunk;
@@ -534,69 +682,109 @@ export async function runChecks(
         const allowedBodyChars = Math.max(0, blockCharBudget - headerChars);
         const allowedBodyBytes = Math.max(0, blockByteBudget - headerBytes);
 
+        let finalMeta: CompactCommandOutputMeta;
+        let failHardTruncated = false;
+
         if (
           entry.pass1Body.length <= allowedBodyChars &&
           pass1BodyBytes <= allowedBodyBytes
         ) {
+          finalMeta = entry.pass1Meta;
           blocks[entry.index] = `${effectiveHeader}${entry.pass1Body}`;
-          continue;
-        }
-
-        const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
-        let targetChars = Math.min(
-          allowedBodyChars,
-          Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar)),
-        );
-        let compactedBody =
-          targetChars > 0
-            ? formatCompactCommandOutput({
-                stdout: entry.result.stdout,
-                stderr: entry.result.stderr,
-                exitCode: entry.result.exitCode,
-                timedOut: entry.result.timedOut,
-                error: entry.result.error,
-                maxChars: targetChars,
-              })
-            : "";
-
-        // Converge char cap when multi-byte density in preserved head/tail exceeds average
-        for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
-          const curBytes = Buffer.byteLength(compactedBody, "utf8");
-          if (curBytes <= allowedBodyBytes) break;
-          targetChars = Math.max(
-            1,
-            Math.min(
-              targetChars - 1,
-              Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98),
-            ),
+        } else {
+          failHardTruncated = true;
+          const bytesPerChar = pass1BodyBytes / Math.max(1, entry.pass1Body.length);
+          let targetChars = Math.min(
+            allowedBodyChars,
+            Math.floor(allowedBodyBytes / Math.max(1, bytesPerChar)),
           );
-          compactedBody = formatCompactCommandOutput({
-            stdout: entry.result.stdout,
-            stderr: entry.result.stderr,
-            exitCode: entry.result.exitCode,
-            timedOut: entry.result.timedOut,
-            error: entry.result.error,
-            maxChars: targetChars,
-          });
+          finalMeta =
+            targetChars > 0
+              ? formatCompactCommandOutputWithMeta({
+                  stdout: entry.result.stdout,
+                  stderr: entry.result.stderr,
+                  exitCode: entry.result.exitCode,
+                  timedOut: entry.result.timedOut,
+                  error: entry.result.error,
+                  maxChars: targetChars,
+                })
+              : {
+                  text: "",
+                  collapsedLines: entry.pass1Meta.collapsedLines,
+                  truncated: true,
+                  rawLines: entry.pass1Meta.rawLines,
+                  rawChars: entry.pass1Meta.rawChars,
+                };
+
+          // Converge char cap when multi-byte density in preserved head/tail exceeds average
+          for (let iter = 0; iter < 4 && targetChars > 1; iter++) {
+            const curBytes = Buffer.byteLength(finalMeta.text, "utf8");
+            if (curBytes <= allowedBodyBytes) break;
+            targetChars = Math.max(
+              1,
+              Math.min(
+                targetChars - 1,
+                Math.floor(targetChars * (allowedBodyBytes / curBytes) * 0.98),
+              ),
+            );
+            finalMeta = formatCompactCommandOutputWithMeta({
+              stdout: entry.result.stdout,
+              stderr: entry.result.stderr,
+              exitCode: entry.result.exitCode,
+              timedOut: entry.result.timedOut,
+              error: entry.result.error,
+              maxChars: targetChars,
+            });
+          }
+
+          blocks[entry.index] = `${effectiveHeader}${finalMeta.text}`;
         }
 
-        blocks[entry.index] = `${effectiveHeader}${compactedBody}`;
+        const otherFailChars = failEntries.reduce(
+          (sum, f, idx) => (idx === j ? sum : sum + f.pass1Block.length),
+          0,
+        );
+        const availableBodyCeiling = Math.max(
+          allowedBodyChars,
+          failPoolChars - otherFailChars - headerChars,
+          Math.floor(failPoolChars / failEntries.length) - headerChars,
+        );
+
+        if (
+          failHardTruncated ||
+          finalMeta.truncated ||
+          finalMeta.collapsedLines >= 20 ||
+          finalMeta.rawChars > availableBodyCeiling
+        ) {
+          spillTriggered = true;
+          truncatedOutcomeIndices.add(entry.index);
+        }
       }
     }
   }
 
-  const fittedBlocks = fitSectionsToByteBudget(
+  const fitTruncated = detectFittedTruncation(
     blocks,
     bodyBudget,
     bodyByteBudget,
     separator,
   );
-  let text = truncateWithNotice(
-    `${summaryHeader}${separator}${fittedBlocks}`,
-    maxChars,
+  if (fitTruncated.size > 0) {
+    for (const idx of fitTruncated) {
+      if (outcomes[idx]?.result) {
+        truncatedOutcomeIndices.add(idx);
+        spillTriggered = true;
+      }
+    }
+  }
+
+  const fittedBody = fitSectionsToByteBudget(
+    blocks,
+    bodyBudget,
+    bodyByteBudget,
+    separator,
   );
-  text = truncateWithByteNotice(text, maxBytes);
-  return { text, isError: false };
+  return { fittedBody, spillTriggered, truncatedOutcomeIndices };
 }
 
 function clampInt(val: unknown, min: number, max: number, fallback: number): number {

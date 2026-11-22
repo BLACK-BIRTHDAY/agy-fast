@@ -17,9 +17,16 @@ import {
 } from "../utils/fs-utils.js";
 import {
   DEFAULT_INLINE_MAX_BYTES,
+  computeWaterFillBudgets,
+  fitSectionsToBudget,
   fitSectionsToByteBudget,
   sliceSafeChars,
 } from "../utils/output-filter.js";
+import {
+  formatSpillFooter,
+  writeSpillFile,
+  type SpillSectionInput,
+} from "../utils/spill.js";
 
 export type SearchQueryType = "text" | "regex" | "glob" | "fuzzy" | "git";
 
@@ -1573,9 +1580,95 @@ export async function runBatchSearch(
     queries.map((q, idx) => executeSingleQuery(q, idx, baseCwd, useRg)),
   );
 
+  const separator = "\n\n";
+  const rawJoined = sections.join(separator);
+  const rawJoinedBytes = Buffer.byteLength(rawJoined, "utf8");
+
+  if (rawJoined.length <= maxChars && rawJoinedBytes <= maxBytes) {
+    return { text: rawJoined, isError: false };
+  }
+
+  // Output exceeds inline char or 8.8 KB UTF-8 ceiling: spill full post-maxResults sections
+  const minBodyChars = Math.max(200, sections.length * 55);
+  const minBodyBytes = minBodyChars;
+  const footerCapChars = Math.min(480, maxChars - minBodyChars);
+  const footerCapBytes = Math.min(900, maxBytes - minBodyBytes);
+
+  if (footerCapChars >= 48 && footerCapBytes >= 48) {
+    const sepChars = separator.length * Math.max(0, sections.length - 1);
+    const sepBytes = Buffer.byteLength(separator, "utf8") * Math.max(0, sections.length - 1);
+    const truncatedMask = new Array<boolean>(sections.length).fill(false);
+
+    if (rawJoined.length > maxChars) {
+      if (sepChars >= maxChars) {
+        truncatedMask.fill(true);
+      } else {
+        const charBudgets = computeWaterFillBudgets(
+          sections.map((s) => s.length),
+          maxChars - sepChars,
+        );
+        for (let i = 0; i < sections.length; i++) {
+          if (sections[i]!.length > (charBudgets[i] ?? 0)) {
+            truncatedMask[i] = true;
+          }
+        }
+      }
+    }
+
+    const charFitted = fitSectionsToBudget(sections, maxChars, separator);
+    if (Buffer.byteLength(charFitted, "utf8") > maxBytes) {
+      if (sepBytes >= maxBytes) {
+        truncatedMask.fill(true);
+      } else {
+        const byteBudgets = computeWaterFillBudgets(
+          sections.map((s) => Buffer.byteLength(s, "utf8")),
+          maxBytes - sepBytes,
+        );
+        for (let i = 0; i < sections.length; i++) {
+          if (Buffer.byteLength(sections[i]!, "utf8") > (byteBudgets[i] ?? 0)) {
+            truncatedMask[i] = true;
+          }
+        }
+      }
+    }
+
+    const spillSections: SpillSectionInput[] = sections.map((sec, idx) => ({
+      label: `Query ${idx + 1}`,
+      content: sec,
+      truncated: truncatedMask[idx] ?? false,
+    }));
+    const spillResult = await writeSpillFile({
+      tool: "batch_search",
+      sections: spillSections,
+    });
+    if (spillResult) {
+      const footer = formatSpillFooter(spillResult, {
+        maxChars: footerCapChars,
+        maxBytes: footerCapBytes,
+      });
+      if (!footer) {
+        await fs.unlink(spillResult.filePath).catch(() => {});
+      } else {
+        const footerBytes = Buffer.byteLength(footer, "utf8");
+        const bodyMaxChars = Math.max(0, maxChars - footer.length);
+        const bodyMaxBytes = Math.max(0, maxBytes - footerBytes);
+        const fittedBody = fitSectionsToByteBudget(
+          sections,
+          bodyMaxChars,
+          bodyMaxBytes,
+          separator,
+        );
+        return {
+          text: `${fittedBody}${footer}`,
+          isError: false,
+        };
+      }
+    }
+  }
+
   // Allocate budget fairly across queries via water-filling within maxChars & inline UTF-8 byte ceiling
   return {
-    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, "\n\n"),
+    text: fitSectionsToByteBudget(sections, maxChars, maxBytes, separator),
     isError: false,
   };
 }
